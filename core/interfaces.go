@@ -377,6 +377,15 @@ type Agent interface {
 	Stop() error
 }
 
+// SessionModeStarter is implemented by agents that support spawning a session
+// with a per-spawn permission-mode override (used by the engine for the
+// admin_mode feature: admins get their own mode while everyone else keeps the
+// project default). mode == "" must behave exactly like StartSession, so agents
+// that don't opt in simply never implement it and keep the old call path.
+type SessionModeStarter interface {
+	StartSessionWithMode(ctx context.Context, sessionID string, mode string) (AgentSession, error)
+}
+
 // AgentSession represents a running interactive agent session with a persistent process.
 type AgentSession interface {
 	// Send sends a user message (with optional images and files) to the running

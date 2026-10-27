@@ -539,6 +539,14 @@ func validateSessionIDInProject(configHome, workDir, sessionID string) bool {
 
 // StartSession creates a persistent interactive Claude Code session.
 func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
+	return a.StartSessionWithMode(ctx, sessionID, "")
+}
+
+// StartSessionWithMode spawns with the given permission mode overriding the
+// agent's configured one (engine's admin_mode injection: admins' private
+// sessions). Empty mode uses a.mode; non-empty values go through
+// normalizePermissionMode, so user-friendly aliases (e.g. "yolo") are accepted.
+func (a *Agent) StartSessionWithMode(ctx context.Context, sessionID string, modeOverride string) (core.AgentSession, error) {
 	a.mu.Lock()
 	tools := make([]string, len(a.allowedTools))
 	copy(tools, a.allowedTools)
@@ -550,6 +558,11 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	effort := a.reasoningEffort
 	workDir := a.workDir
 	mode := a.mode
+	// modeOverride 空 = 未启用 admin_mode，保持配置档；normalize("") 会
+	// 落 default 强制覆盖，因此必须先判空再归一化
+	if modeOverride != "" {
+		mode = normalizePermissionMode(modeOverride)
+	}
 	pluginDirs := make([]string, len(a.pluginDirs))
 	copy(pluginDirs, a.pluginDirs)
 	extraEnv := a.runtimeEnvLocked()

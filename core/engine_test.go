@@ -7749,7 +7749,7 @@ func TestSessionMismatch_RecyclesStaleAgent(t *testing.T) {
 	// The active Session now wants a DIFFERENT agent session ID.
 	session := &Session{AgentSessionID: "new-agent-id"}
 
-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
 
 	if state.agentSession == oldSess {
 		t.Fatal("expected stale agent session to be replaced")
@@ -7786,7 +7786,7 @@ func TestSessionClearedAfterNew_RecyclesAliveAgent(t *testing.T) {
 
 	session := &Session{AgentSessionID: ""}
 
-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
 	if state.agentSession == oldSess {
 		t.Fatal("expected stale agent to be recycled when AgentSessionID was cleared")
 	}
@@ -7821,7 +7821,7 @@ func TestSessionMismatch_ReusesWhenIDsMatch(t *testing.T) {
 
 	session := &Session{AgentSessionID: "matching-id"}
 
-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
 	if state != existingState {
 		t.Fatal("expected existing state to be reused when session IDs match")
 	}
@@ -7839,7 +7839,7 @@ func TestSessionIDWriteback_ImmediateAfterStartSession(t *testing.T) {
 	key := "test:user1"
 	session := &Session{AgentSessionID: ""} // empty — no prior binding
 
-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
 
 	got := session.GetAgentSessionID()
 
@@ -7860,7 +7860,7 @@ func TestSessionIDWriteback_MapsSessionName(t *testing.T) {
 	key := "test:user1"
 	session := e.sessions.NewSession(key, "我的自定义会话")
 
-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
 
 	got := e.sessions.GetSessionName("agent-uuid-456")
 	if got != "我的自定义会话" {
@@ -7882,7 +7882,7 @@ func TestSessionIDWriteback_TracksLiveForkedID(t *testing.T) {
 	key := "test:user1"
 	session := &Session{AgentSessionID: "existing-uuid"}
 
-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
 
 	got := session.GetAgentSessionID()
 
@@ -7908,7 +7908,7 @@ func TestInteractiveWriteBack_TracksForkedSessionID(t *testing.T) {
 	// Session already holds the original (now stale) ID from a prior turn.
 	session := &Session{AgentSessionID: "orig-id", AgentType: "controllable"}
 
-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
 
 	if got := session.GetAgentSessionID(); got != "forked-id" {
 		t.Fatalf("AgentSessionID = %q, want %q — must track the live forked ID", got, "forked-id")
@@ -7930,7 +7930,7 @@ func TestInteractiveWriteBack_NamingBindsOnlyOnFirstAssignment(t *testing.T) {
 	session := &Session{Name: "my-feature", AgentType: "controllable"}
 
 	// First assignment: name should bind to first-id.
-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
 	if got := e.sessions.GetSessionName("first-id"); got != "my-feature" {
 		t.Fatalf("first-id name = %q, want %q on first assignment", got, "my-feature")
 	}
@@ -7943,7 +7943,7 @@ func TestInteractiveWriteBack_NamingBindsOnlyOnFirstAssignment(t *testing.T) {
 	delete(e.interactiveStates, key) // force a fresh start path
 	e.interactiveMu.Unlock()
 
-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
 	if got := session.GetAgentSessionID(); got != "forked-id" {
 		t.Fatalf("AgentSessionID = %q, want %q after fork", got, "forked-id")
 	}
@@ -8010,7 +8010,7 @@ func TestResumeFallback_ClearsStaleSessionID(t *testing.T) {
 	// Session has a stale AgentSessionID from a previously killed agent.
 	session := &Session{AgentSessionID: "stale-id", AgentType: "controllable"}
 
-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", "")
 
 	// The new agent session should be the fresh one.
 	if state.agentSession != freshSess {
@@ -8051,7 +8051,7 @@ func TestStaleGoroutineCleanup_RaceSimulation(t *testing.T) {
 
 	// Step 3: New turn creates Session B and calls getOrCreateInteractiveStateWith.
 	sessionB := &Session{AgentSessionID: ""}
-	newState := e.getOrCreateInteractiveStateWith(key, p, "ctx", sessionB, e.sessions, nil, "")
+	newState := e.getOrCreateInteractiveStateWith(key, p, "ctx", sessionB, e.sessions, nil, "", "")
 
 	// Verify S2 is in the map.
 	e.interactiveMu.Lock()
@@ -8529,7 +8529,7 @@ func TestResumeFailureFallbackToFreshSession(t *testing.T) {
 	session.SetAgentSessionID("old-session-id", "stub")
 
 	p := &stubPlatformEngine{n: "test"}
-	state := e.getOrCreateInteractiveStateWith("test:user1", p, "ctx", session, e.sessions, nil, "")
+	state := e.getOrCreateInteractiveStateWith("test:user1", p, "ctx", session, e.sessions, nil, "", "")
 
 	if state.agentSession == nil {
 		t.Fatal("expected agentSession to be non-nil after fallback")
@@ -8567,7 +8567,7 @@ func TestFreshSessionWithoutSavedSessionIDStartsFresh(t *testing.T) {
 	session := e.sessions.GetOrCreateActive("test:user2")
 
 	p := &stubPlatformEngine{n: "test"}
-	state := e.getOrCreateInteractiveStateWith("test:user2", p, "ctx", session, e.sessions, nil, "")
+	state := e.getOrCreateInteractiveStateWith("test:user2", p, "ctx", session, e.sessions, nil, "", "")
 
 	if state.agentSession == nil {
 		t.Fatal("expected agentSession to be non-nil")
@@ -8604,7 +8604,7 @@ func TestWorkspaceReconnectWithSavedSessionIDUsesExactResume(t *testing.T) {
 	session.SetAgentSessionID("saved-session-id", "stub")
 
 	p := &stubPlatformEngine{n: "test"}
-	state := e.getOrCreateInteractiveStateWith("test:user3", p, "ctx", session, e.sessions, nil, "")
+	state := e.getOrCreateInteractiveStateWith("test:user3", p, "ctx", session, e.sessions, nil, "", "")
 
 	if state.agentSession == nil {
 		t.Fatal("expected agentSession to be non-nil")
@@ -16954,5 +16954,105 @@ func TestAdminSessionRegistry(t *testing.T) {
 	e.markAdminSession("wecom:chat:bob", "bob")
 	if e.isAdminSession("wecom:chat:bob") {
 		t.Fatal("non-admin session must not be registered")
+	}
+}
+
+// modeRecordingAgent 记录 spawn 调用路径：普通 StartSession 与带权限档
+// 覆盖的 StartSessionWithMode 各自计数，用于断言 admin_mode 注入走向。
+type modeRecordingAgent struct {
+	stubAgent
+	mu        sync.Mutex
+	plainHits int
+	withModes []string
+}
+
+func (a *modeRecordingAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.plainHits++
+	return &stubAgentSession{}, nil
+}
+
+func (a *modeRecordingAgent) StartSessionWithMode(_ context.Context, _ string, mode string) (AgentSession, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.withModes = append(a.withModes, mode)
+	return &stubAgentSession{}, nil
+}
+
+func TestIsGroupSessionKey(t *testing.T) {
+	cases := []struct {
+		key  string
+		want bool
+	}{
+		{"wecom:chat:group", true},          // 群共享会话
+		{"wecom:chat:wohR_user1", false},    // 私聊（末段为用户 ID）
+		{"ws1:wecom:chat:group", true},      // multi-workspace 前缀群聊
+		{"ws1:wecom:chat:wohR_user1", false}, // multi-workspace 前缀私聊
+		{"", false},
+		{"nogroup", false},
+	}
+	for _, c := range cases {
+		if got := isGroupSessionKey(c.key); got != c.want {
+			t.Errorf("isGroupSessionKey(%q) = %v, want %v", c.key, got, c.want)
+		}
+	}
+}
+
+func TestAdminModeOverride(t *testing.T) {
+	e := &Engine{}
+	e.SetAdminFrom("admin-1")
+	// 未配置 admin_mode：所有人都回落项目默认档
+	e.SetAdminMode("")
+	if got := e.adminModeOverride("wecom:chat:admin-1", "admin-1"); got != "" {
+		t.Fatalf("empty admin_mode should return empty, got %q", got)
+	}
+
+	e.SetAdminMode("bypassPermissions")
+	// admin 私聊：注入配置档
+	if got := e.adminModeOverride("wecom:chat:admin-1", "admin-1"); got != "bypassPermissions" {
+		t.Fatalf("admin private session should get admin_mode, got %q", got)
+	}
+	// multi-workspace 前缀私聊同样生效
+	if got := e.adminModeOverride("ws1:wecom:chat:admin-1", "admin-1"); got != "bypassPermissions" {
+		t.Fatalf("prefixed admin private session should get admin_mode, got %q", got)
+	}
+	// 非 admin：不注入
+	if got := e.adminModeOverride("wecom:chat:bob", "bob"); got != "" {
+		t.Fatalf("non-admin session must not get admin_mode, got %q", got)
+	}
+	// 群聊共享会话：即使 admin 触发也不注入（群内多用户共享，不能整群提权）
+	if got := e.adminModeOverride("wecom:chat:group", "admin-1"); got != "" {
+		t.Fatalf("group session must never get admin_mode, got %q", got)
+	}
+	if got := e.adminModeOverride("ws1:wecom:chat:group", "admin-1"); got != "" {
+		t.Fatalf("prefixed group session must never get admin_mode, got %q", got)
+	}
+}
+
+func TestStartAgentSession_ModeOverride(t *testing.T) {
+	e := &Engine{}
+	rec := &modeRecordingAgent{}
+
+	// 空 override：走普通 StartSession
+	if _, err := e.startAgentSession(rec, "s1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if rec.plainHits != 1 || len(rec.withModes) != 0 {
+		t.Fatalf("empty override should use plain StartSession: plain=%d withMode=%d", rec.plainHits, len(rec.withModes))
+	}
+
+	// 非空 override + agent 实现接口：走 StartSessionWithMode 并透传 mode
+	if _, err := e.startAgentSession(rec, "s2", "bypassPermissions"); err != nil {
+		t.Fatal(err)
+	}
+	if rec.plainHits != 1 || len(rec.withModes) != 1 || rec.withModes[0] != "bypassPermissions" {
+		t.Fatalf("override should route to StartSessionWithMode: plain=%d withModes=%v", rec.plainHits, rec.withModes)
+	}
+
+	// 非空 override + agent 未实现接口（如 codex）：安全回落普通路径
+	plain := &stubAgent{}
+	if _, err := e.startAgentSession(plain, "s3", "bypassPermissions"); err != nil {
+		t.Fatal(err)
 	}
 }

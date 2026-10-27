@@ -544,6 +544,8 @@ func main() {
 
 		// Wire admin allowlist for privileged commands
 		engine.SetAdminFrom(proj.AdminFrom)
+		// Wire admin permission mode (admins' private sessions)
+		engine.SetAdminMode(proj.AdminMode)
 
 		// Wire per-user role-based policies
 		if proj.Users != nil {
@@ -1925,6 +1927,8 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 
 	// Reload admin allowlist
 	engine.SetAdminFrom(proj.AdminFrom)
+	// Reload admin permission mode
+	engine.SetAdminMode(proj.AdminMode)
 
 	// Reload per-user role-based policies
 	if proj.Users != nil {

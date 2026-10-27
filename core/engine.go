@@ -403,6 +403,7 @@ type Engine struct {
 
 	disabledCmds map[string]bool
 	adminFrom    string           // comma-separated user IDs for privileged commands; "*" = all allowed users; "" = deny
+	adminMode    string           // per-spawn permission mode for admins' private sessions; "" = disabled, everyone uses project mode
 	userRoles    *UserRoleManager // nil = legacy mode (no per-user policies)
 	userRolesMu  sync.RWMutex     // protects userRoles, disabledCmds, and adminFrom
 
@@ -1293,6 +1294,14 @@ func (e *Engine) SetAdminFrom(adminFrom string) {
 	}
 }
 
+// SetAdminMode sets the permission mode injected when spawning private sessions
+// for admin users (admin_mode config). Empty keeps the project mode for everyone.
+func (e *Engine) SetAdminMode(mode string) {
+	e.userRolesMu.Lock()
+	e.adminMode = strings.TrimSpace(mode)
+	e.userRolesMu.Unlock()
+}
+
 // privilegedCommands are commands that require admin_from authorization.
 var privilegedCommands = map[string]bool{
 	"shell":   true,
@@ -1378,6 +1387,43 @@ func (e *Engine) adminFromConfigured() bool {
 	e.userRolesMu.RLock()
 	defer e.userRolesMu.RUnlock()
 	return e.adminFrom != ""
+}
+
+// adminModeOverride 返回 admin 私聊会话 spawn 时注入的权限档（admin_mode
+// 配置）。三个条件缺一不可：未配置返回空；群聊会话永不注入——群共享会话
+// 由多名用户共享，admin 触发也不能把整群提权为全权限档。返回空即回落到
+// 普通 StartSession 路径，语义与未开启该特性完全一致。
+func (e *Engine) adminModeOverride(sessionKey, userID string) string {
+	e.userRolesMu.RLock()
+	am := e.adminMode
+	e.userRolesMu.RUnlock()
+	if am == "" || !e.isAdmin(userID) || isGroupSessionKey(sessionKey) {
+		return ""
+	}
+	return am
+}
+
+// startAgentSession spawn 会话：modeOverride 非空且 agent 实现了
+// SessionModeStarter 时注入专属权限档（admin_mode：admin 私聊会话免弹窗），
+// 其余情况走原生 StartSession，行为与未开启该特性完全一致。
+func (e *Engine) startAgentSession(agent Agent, sessionID, modeOverride string) (AgentSession, error) {
+	if modeOverride != "" {
+		if starter, ok := agent.(SessionModeStarter); ok {
+			slog.Info("session spawned with admin_mode override",
+				"session_id", sessionID, "mode", modeOverride, "agent", agent.Name())
+			return starter.StartSessionWithMode(e.ctx, sessionID, modeOverride)
+		}
+	}
+	return agent.StartSession(e.ctx, sessionID)
+}
+
+// isGroupSessionKey 判断 sessionKey（含 multi-workspace 前缀形态）是否为
+// 群聊共享会话。群共享会话最后一段固定为 "group"（见 wecom websocket 的
+// group_shared_sessions）；私聊最后一段是用户 ID，与 "group" 字面量不会
+// 冲突。按末段判断兼容 workspace 前缀（workspace:wecom:chatID:group）。
+func isGroupSessionKey(sessionKey string) bool {
+	parts := strings.Split(sessionKey, ":")
+	return parts[len(parts)-1] == "group"
 }
 
 // markAdminSession 在 admin 用户的消息进入时登记其 sessionKey，供卡片动作
@@ -4115,7 +4161,9 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	if agent != e.agent {
 		agentOverride = agent
 	}
-	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey)
+	// admin_mode：admin 私聊会话注入专属权限档（群聊/非 admin 返回空，回落默认）
+	modeOverride := e.adminModeOverride(interactiveKey, msg.UserID)
+	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, modeOverride)
 
 	// Set workspaceDir on the state for idle reaper identification
 	if workspaceDir != "" {
@@ -4398,7 +4446,9 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
 
 // When agentOverride is non-nil it is used instead of e.agent to start the session.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY env injection; otherwise sessionKey is used.
-func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string) *interactiveState {
+// modeOverride, when non-empty, is injected as the spawn permission mode instead of
+// the agent's configured mode (admin_mode: admins' private sessions only).
+func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, modeOverride string) *interactiveState {
 	// /stop removes the state from the map immediately but tears the process
 	// down in the background. Wait that teardown out *before* taking the lock:
 	// spawning now would start a second process on the same agent session ID
@@ -4537,7 +4587,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 
 	isResume := startSessionID != ""
 	startAt := time.Now()
-	agentSession, err := agent.StartSession(e.ctx, startSessionID)
+	agentSession, err := e.startAgentSession(agent, startSessionID, modeOverride)
 	startElapsed := time.Since(startAt)
 	if err != nil {
 		// If resume/continue failed, try a fresh session as fallback.
@@ -4550,7 +4600,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 			session.SetAgentSessionID("", agent.Name())
 			sessions.Save()
 			startAt = time.Now()
-			agentSession, err = agent.StartSession(e.ctx, "")
+			agentSession, err = e.startAgentSession(agent, "", modeOverride)
 			startElapsed = time.Since(startAt)
 			if err == nil {
 				slog.Info("fresh session started after resume failure",
