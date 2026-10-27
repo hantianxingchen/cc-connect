@@ -241,6 +241,57 @@ func TestRestartBootstrapsUnloadedService(t *testing.T) {
 	}
 }
 
+// TestStartBootstrapsWhenKickstartFailsOnStaleLoadedState reproduces the
+// `daemon restart` failure mode where Stop()'s bootout has deregistered the
+// service but launchctl print's view still reports it as loaded (launchd state
+// propagation lags). Start() picks the kickstart branch from that stale answer,
+// kickstart then fails with exit 113 ("Could not find service"), and the
+// pre-fix code returned that error immediately — leaving the daemon offline
+// until a second manual start. The fix falls through to bootstrap, which
+// re-registers the plist and recovers in one shot.
+func TestStartBootstrapsWhenKickstartFailsOnStaleLoadedState(t *testing.T) {
+	orig := runLaunchctl
+	t.Cleanup(func() { runLaunchctl = orig })
+
+	dir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", dir)
+	if origHome != "" {
+		t.Cleanup(func() { _ = os.Setenv("HOME", origHome) })
+	}
+	guiDomain := launchdGUIDomain()
+
+	var calls []string
+	runLaunchctl = func(args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		if len(args) < 2 {
+			return "", nil
+		}
+		switch args[0] {
+		case "print":
+			// Stale state: both the domain and the target still report as loaded.
+			return "state = running", nil
+		case "kickstart":
+			// Service is actually deregistered — the real-world exit 113
+			// "Could not find service". Fails on any retry too: recovery must
+			// go through bootstrap, whose plist carries RunAtLoad to start it.
+			return "Could not find service", fmt.Errorf("exit status 113")
+		case "bootstrap":
+			return "", nil
+		default:
+			t.Fatalf("unexpected launchctl call: %v", args)
+			return "", nil
+		}
+	}
+
+	if err := (&launchdManager{}).Start(); err != nil {
+		t.Fatalf("Start() should fall back to bootstrap after kickstart 113, got: %v", err)
+	}
+	if !containsCall(calls, "bootstrap "+guiDomain+" "+launchdPlistPath()) {
+		t.Fatalf("expected bootstrap re-registration after kickstart failure, calls = %#v", calls)
+	}
+}
+
 // collectXMLText walks the XML stream and returns every chardata text node.
 // Used by the plist-escape test to verify path values round-trip through
 // xml.Decoder regardless of how deeply they are nested.
