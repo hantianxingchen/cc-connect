@@ -1616,6 +1616,32 @@ func loadLocked() (*Config, error) {
 	return cfg, nil
 }
 
+// writeConfigAtomic 以 temp+rename 原子写回原样保留的配置文本
+// （patchAllowFromText 产物，不走 encoder 以免抹掉注释）
+func writeConfigAtomic(data []byte) error {
+	dir := filepath.Dir(ConfigPath)
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp config: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("write config: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return os.Rename(tmpPath, ConfigPath)
+}
+
 func saveConfig(cfg *Config) error {
 	dir := filepath.Dir(ConfigPath)
 	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
@@ -3456,6 +3482,91 @@ type ProjectSettingsUpdate struct {
 	WorkspaceBaseDir *string
 }
 
+// onlyAllowFrom 报告本次 update 是否只改平台 allow_from（/allowlist 热更新
+// 落盘场景）。此时走 patchAllowFromText 文本手术路径保留注释；混合其他
+// 字段的更新仍走全量重写
+func (u ProjectSettingsUpdate) onlyAllowFrom() bool {
+	return u.PlatformAllowFrom != nil && u.Language == nil && u.AdminFrom == nil &&
+		u.DisabledCommands == nil && u.WorkDir == nil && u.Mode == nil &&
+		u.AgentType == nil && u.ShowContextIndicator == nil &&
+		u.ShowWorkdirIndicator == nil && u.ReplyFooter == nil &&
+		u.InjectSender == nil && u.WorkspaceMode == nil && u.WorkspaceBaseDir == nil
+}
+
+var (
+	tomlSectionRe   = regexp.MustCompile(`^\s*(\[\[?)([^\]]+)(\]\]?)\s*(#.*)?$`)
+	tomlStringValRe = regexp.MustCompile(`^\s*([A-Za-z0-9_-]+)\s*=\s*["']([^"']*)["']`)
+	allowFromLineRe = regexp.MustCompile(`^(\s*)allow_from\s*=\s*("[^"]*"|'[^']*')`)
+)
+
+// patchAllowFromText 在原文上只替换目标 platform 块内的 allow_from 行，
+// 逐字节保留其余内容（含注释与格式——全量重序列化会抹掉用户注释）。
+// 状态机扫行跟踪三层归属：[[projects]] 直接层（识别 name）、
+// [[projects.platforms]] 直接层（识别 type）、platforms.options 子表
+// （allow_from 所在，仍归属当前 platform）。仅在唯一匹配（恰好一个目标
+// platform 块且块内恰好一行 allow_from）时返回替换后文本；其余情况
+// （allow_from 未配置、同名 project、同 type 多 platform）返回 ok=false，
+// 由调用方回落全量重写兜底。
+func patchAllowFromText(data []byte, projectName, platformType, newValue string) ([]byte, bool) {
+	lines := strings.Split(string(data), "\n")
+	inProjectBlock := false // 当前在 [[projects]] 直接层
+	inPlatformBlock := false
+	inTargetProject := false
+	platformMatched := false // 当前 platform 块 type 已匹配目标
+	matchCount := 0
+	targetIdx := -1
+
+	for i, line := range lines {
+		if m := tomlSectionRe.FindStringSubmatch(line); m != nil {
+			section, isArray := m[2], m[1] == "[["
+			switch {
+			case isArray && section == "projects":
+				inProjectBlock, inPlatformBlock = true, false
+				inTargetProject, platformMatched = false, false
+			case isArray && section == "projects.platforms" ||
+				(isArray && strings.HasPrefix(section, "projects.") && strings.HasSuffix(section, ".platforms")):
+				inProjectBlock, inPlatformBlock = false, true
+				platformMatched = false
+			case strings.HasPrefix(section, "projects.platforms.options"):
+				// 当前 platform 的子表（allow_from 在这里）：platform 归属不变
+			case strings.HasPrefix(section, "projects."):
+				// project 其他子表（agent/providers 等）：离开直接层与 platform 层，
+				// 防止子表内的 name=...（如 provider 名）污染 project 判定
+				inProjectBlock, inPlatformBlock = false, false
+			default:
+				// 离开 projects 区域
+				inProjectBlock, inPlatformBlock = false, false
+				inTargetProject, platformMatched = false, false
+			}
+			continue
+		}
+		if m := tomlStringValRe.FindStringSubmatch(line); m != nil {
+			key, val := m[1], m[2]
+			switch key {
+			case "name":
+				if inProjectBlock {
+					inTargetProject = val == projectName
+				}
+			case "type":
+				if inPlatformBlock && inTargetProject {
+					platformMatched = val == platformType
+				}
+			case "allow_from":
+				if inTargetProject && platformMatched {
+					matchCount++
+					targetIdx = i
+				}
+			}
+		}
+	}
+	if matchCount != 1 || targetIdx < 0 {
+		return nil, false
+	}
+	lines[targetIdx] = allowFromLineRe.ReplaceAllString(lines[targetIdx],
+		fmt.Sprintf("${1}allow_from = %q", newValue))
+	return []byte(strings.Join(lines, "\n")), true
+}
+
 // SaveProjectSettings persists project-level settings and the global language to config.toml.
 func SaveProjectSettings(projectName string, update ProjectSettingsUpdate) error {
 	configMu.Lock()
@@ -3470,6 +3581,21 @@ func SaveProjectSettings(projectName string, update ProjectSettingsUpdate) error
 	cfg := &Config{}
 	if err := toml.Unmarshal(data, cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
+	}
+
+	// /allowlist 热更新落盘优先走文本手术：只改目标 allow_from 行、保留
+	// 注释与格式（全量重序列化会抹掉用户注释）。未匹配到唯一目标行时
+	// 回落下方全量路径兜底
+	if update.onlyAllowFrom() {
+		for typ, af := range update.PlatformAllowFrom {
+			if patched, ok := patchAllowFromText(data, projectName, typ, af); ok {
+				if err := writeConfigAtomic(patched); err != nil {
+					return err
+				}
+				return nil
+			}
+			break
+		}
 	}
 
 	if update.Language != nil {

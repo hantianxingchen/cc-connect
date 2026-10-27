@@ -3605,3 +3605,131 @@ func TestRemoveGlobalProvider_CleansUpProviderRefs(t *testing.T) {
 		t.Errorf("proj2 provider_refs: want [], got %v", refs2)
 	}
 }
+
+func TestPatchAllowFromText_PreservesComments(t *testing.T) {
+	src := `data_dir = ""
+
+[[projects]]
+  # 项目：企微通道
+  name = "xiaowei"
+  admin_from = "wohR_admin"
+
+  [projects.agent]
+    type = "claudecode"
+
+  [[projects.platforms]]
+    type = "wecom"
+
+    [projects.platforms.options]
+      # 准入名单：仅授权用户
+      allow_from = "id-a"
+      bot_secret = "keep-me"
+
+[[projects]]
+  # 项目：微信通道
+  name = "xiaowei-weixin"
+
+  [[projects.platforms]]
+    type = "weixin"
+
+    [projects.platforms.options]
+      allow_from = "wx-owner"
+
+[log]
+  level = "info" # 日志级别
+`
+	out, ok := patchAllowFromText([]byte(src), "xiaowei", "wecom", "id-a,id-b")
+	if !ok {
+		t.Fatal("expected unique match")
+	}
+	got := string(out)
+	// 目标行更新
+	if !strings.Contains(got, `allow_from = "id-a,id-b"`) {
+		t.Fatalf("wecom allow_from not updated:\n%s", got)
+	}
+	// 其他 project 的 allow_from 不动
+	if !strings.Contains(got, `allow_from = "wx-owner"`) {
+		t.Fatalf("weixin allow_from must stay:\n%s", got)
+	}
+	// 注释逐条保留
+	for _, c := range []string{"# 项目：企微通道", "# 准入名单：仅授权用户", "# 项目：微信通道", "# 日志级别"} {
+		if !strings.Contains(got, c) {
+			t.Fatalf("comment lost: %s\n%s", c, got)
+		}
+	}
+	// 其余键不动
+	if !strings.Contains(got, `bot_secret = "keep-me"`) {
+		t.Fatal("sibling keys must stay")
+	}
+	// 行数不变（只有目标行被改写）
+	if strings.Count(got, "\n") != strings.Count(src, "\n") {
+		t.Fatal("line count must be unchanged")
+	}
+}
+
+func TestPatchAllowFromText_Fallbacks(t *testing.T) {
+	// 目标 platform 无 allow_from 行 → 回落
+	src := `[[projects]]
+  name = "p1"
+  [[projects.platforms]]
+    type = "wecom"
+`
+	if _, ok := patchAllowFromText([]byte(src), "p1", "wecom", "x"); ok {
+		t.Fatal("missing allow_from line should return false")
+	}
+	// project 不存在 → 回落
+	if _, ok := patchAllowFromText([]byte(src), "nope", "wecom", "x"); ok {
+		t.Fatal("unknown project should return false")
+	}
+	// 同 project 两个同 type platform（两行 allow_from）→ 回落（歧义）
+	src2 := `[[projects]]
+  name = "p1"
+  [[projects.platforms]]
+    type = "wecom"
+    [projects.platforms.options]
+      allow_from = "a"
+  [[projects.platforms]]
+    type = "wecom"
+    [projects.platforms.options]
+      allow_from = "b"
+`
+	if _, ok := patchAllowFromText([]byte(src2), "p1", "wecom", "x"); ok {
+		t.Fatal("ambiguous duplicate platforms should return false")
+	}
+}
+
+func TestSaveProjectSettings_AllowFromKeepsComments(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	src := `[[projects]]
+  # 主通道
+  name = "p1"
+  [[projects.platforms]]
+    type = "wecom"
+    [projects.platforms.options]
+      allow_from = "id-a"
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := ConfigPath
+	ConfigPath = path
+	t.Cleanup(func() { ConfigPath = oldPath })
+
+	if err := SaveProjectSettings("p1", ProjectSettingsUpdate{
+		PlatformAllowFrom: map[string]string{"wecom": "id-a,id-b"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, `allow_from = "id-a,id-b"`) {
+		t.Fatalf("allow_from not updated:\n%s", got)
+	}
+	if !strings.Contains(got, "# 主通道") {
+		t.Fatalf("comment lost:\n%s", got)
+	}
+}
