@@ -7186,6 +7186,7 @@ var builtinCommands = []struct {
 }{
 	{[]string{"new"}, "new"},
 	{[]string{"list", "sessions"}, "list"},
+	{[]string{"allowlist"}, "allowlist"},
 	{[]string{"switch"}, "switch"},
 	{[]string{"name", "rename"}, "name"},
 	{[]string{"current"}, "current"},

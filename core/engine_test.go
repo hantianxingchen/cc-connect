@@ -17207,3 +17207,38 @@ func TestApplyPlatformAllowFrom(t *testing.T) {
 		t.Fatalf("SetAllowFrom should be called once, got %v", mgr.persisted)
 	}
 }
+
+// TestHandleCommand_AllowlistFullPath 走 handleCommand 全链路（matchPrefix
+// 识别 builtinCommands → admin 门禁 → 执行），防止只测 cmdAllowlist 而漏掉
+// 命令注册导致的"转发给 agent"（2026-10-28 真机踩坑：case 加了、
+// builtinCommands 没注册）
+func TestHandleCommand_AllowlistFullPath(t *testing.T) {
+	e := &Engine{i18n: NewI18n("zh")}
+	e.SetAdminFrom("admin-1")
+	p := &allowFromStubPlatform{allow: "admin-1"}
+	e.SetPersistAllowFromFunc(func(_, _ string) error { return nil })
+
+	// admin 发 /allowlist add：识别为内置命令并真正执行（返回 true）
+	msg := &Message{UserID: "admin-1"}
+	if !e.handleCommand(p, msg, "/allowlist add wohR_new1") {
+		t.Fatal("handleCommand must claim /allowlist (builtinCommands registered)")
+	}
+	if p.GetAllowFrom() != "admin-1,wohR_new1" {
+		t.Fatalf("allow = %q, want admin-1,wohR_new1", p.GetAllowFrom())
+	}
+	if len(p.sent) != 1 || !strings.Contains(p.sent[0], "已添加") {
+		t.Fatalf("reply = %v", p.sent)
+	}
+
+	// 非 admin：被特权门禁拦截（返回 true 且名单不变）
+	p2 := &allowFromStubPlatform{allow: "admin-1"}
+	if !e.handleCommand(p2, &Message{UserID: "bob"}, "/allowlist add wohR_x") {
+		t.Fatal("non-admin /allowlist must be claimed (denied with admin-required)")
+	}
+	if p2.GetAllowFrom() != "admin-1" {
+		t.Fatalf("non-admin must not change allow: %q", p2.GetAllowFrom())
+	}
+	if len(p2.sent) != 1 {
+		t.Fatalf("non-admin should get denial reply, sent = %v", p2.sent)
+	}
+}
