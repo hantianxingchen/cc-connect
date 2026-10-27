@@ -384,6 +384,9 @@ type Engine struct {
 
 	displaySaveFunc  func(mode *string, thinkingMessages *bool, thinkingMaxLen, toolMaxLen *int, toolMessages *bool) error
 	configReloadFunc func() (*ConfigReloadResult, error)
+	// persistAllowFrom 把新 allow_from 写回 config.toml（main.go 注入 config.
+	// SaveProjectSettings 桥）。nil = 不落盘（如测试），仅内存生效
+	persistAllowFrom func(platformName, allowFrom string) error
 
 	hooks              *HookManager
 	cronScheduler      *CronScheduler
@@ -1179,6 +1182,12 @@ func (e *Engine) SetConfigReloadFunc(fn func() (*ConfigReloadResult, error)) {
 	e.configReloadFunc = fn
 }
 
+// SetPersistAllowFromFunc 注入 allow_from 落盘回调（main.go 桥接
+// config.SaveProjectSettings），/allowlist 命令执行后防 daemon 重启丢失
+func (e *Engine) SetPersistAllowFromFunc(fn func(platformName, allowFrom string) error) {
+	e.persistAllowFrom = fn
+}
+
 // GetAgent returns the engine's agent (for type assertions like ProviderSwitcher).
 func (e *Engine) GetAgent() Agent {
 	return e.agent
@@ -1304,13 +1313,14 @@ func (e *Engine) SetAdminMode(mode string) {
 
 // privilegedCommands are commands that require admin_from authorization.
 var privilegedCommands = map[string]bool{
-	"shell":   true,
-	"show":    true,
-	"dir":     true,
-	"restart": true,
-	"upgrade": true,
-	"web":     true,
-	"diff":    true,
+	"shell":     true,
+	"show":      true,
+	"dir":       true,
+	"restart":   true,
+	"upgrade":   true,
+	"web":       true,
+	"diff":      true,
+	"allowlist": true,
 }
 
 // isPrivilegedCommandInvocation extends the privilegedCommands map to
@@ -3251,6 +3261,17 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		sessions = wsSessions
 		agent = wsAgent
 		interactiveKey = resolvedWorkspace + ":" + msg.SessionKey
+	}
+
+	// 人话加白语义触发（仅 admin）：消息含「白名单」关键词 + ID 形态 token
+	// → 自动转 /allowlist add，免记命令。非 admin 不触发（转过去也会被特权
+	// 门禁拒）；无 ID 或含移除类动词时返回空，消息正常进 agent。
+	if len(msg.Images) == 0 && !strings.HasPrefix(content, "/") && e.isAdmin(msg.UserID) {
+		if raw := allowlistIntentFromText(content); raw != "" {
+			if e.handleCommand(p, msg, raw) {
+				return
+			}
+		}
 	}
 
 	if len(msg.Images) == 0 && strings.HasPrefix(content, "/") {
@@ -7430,6 +7451,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdSkills(p, msg)
 	case "config":
 		e.cmdConfig(p, msg, args)
+	case "allowlist":
+		e.cmdAllowlist(p, msg, args)
 	case "doctor":
 		e.cmdDoctor(p, msg)
 	case "upgrade":
@@ -16271,6 +16294,189 @@ func (e *Engine) cmdConfigReload(p Platform, msg *Message) {
 	}
 	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgConfigReloaded),
 		result.DisplayUpdated, result.ProvidersUpdated, result.CommandsUpdated))
+}
+
+// cmdAllowlist 处理 /allowlist add|remove|list（特权命令，仅 admin）。
+// 名单经 platform 的 AllowFromManager 热替换（下一条消息立即生效），再经
+// persistAllowFrom 写回 config.toml 防重启丢失——闭环：N1 拦截通知带 ID →
+// admin 手机上回 /allowlist add <ID>，全程无需电脑、无需 daemon restart。
+func (e *Engine) cmdAllowlist(p Platform, msg *Message, args []string) {
+	m, ok := p.(AllowFromManager)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, "❌ 该平台不支持运行时修改准入名单")
+		return
+	}
+	cur := m.GetAllowFrom()
+	sub := ""
+	if len(args) > 0 {
+		sub = strings.ToLower(strings.TrimSpace(args[0]))
+	}
+	switch sub {
+	case "add":
+		id := extractAllowlistID(args)
+		if id == "" {
+			e.reply(p, msg.ReplyCtx, "用法：/allowlist add <用户ID>\n（收到拦截通知时直接复制其中的 ID）")
+			return
+		}
+		// cur 为空或 * 都等于"放行所有人"：此时"添加"语义上是收紧名单到
+		// 单人，超出 admin 预期，拒绝并说明，避免无意把其他人全挡在门外
+		if cur == "*" || cur == "" {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ 当前名单为空/全员放行（%s），直接添加会把名单收紧到仅 %s，请先手动在 config.toml 配置基础名单", displayAllowFrom(cur), id))
+			return
+		}
+		if allowFromContains(cur, id) {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf("ℹ️ %s 已在名单中", id))
+			return
+		}
+		next := strings.TrimSpace(cur + "," + id)
+		e.applyAllowFrom(p, m, msg, next, fmt.Sprintf("✅ 已添加 %s，立即生效", id))
+
+	case "remove":
+		id := extractAllowlistID(args)
+		if id == "" {
+			e.reply(p, msg.ReplyCtx, "用法：/allowlist remove <用户ID>")
+			return
+		}
+		if !allowFromContains(cur, id) {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf("ℹ️ %s 不在名单中", id))
+			return
+		}
+		next := allowFromRemove(cur, id)
+		// AllowList 对空串放行所有人：移除最后一条会把"拒绝制"翻转成
+		// "全放行"，必须挡住，避免 admin 无意间敞开 bot
+		if next == "" {
+			e.reply(p, msg.ReplyCtx, "❌ 名单只剩这一条，移除后等于放行所有人；如确要全放请在 config.toml 配置 allow_from = \"*\"")
+			return
+		}
+		e.applyAllowFrom(p, m, msg, next, fmt.Sprintf("✅ 已移除 %s，立即生效", id))
+
+	default: // list 或无参
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("当前准入名单：%s\n\n用法：/allowlist add|remove <ID>", displayAllowFrom(cur)))
+	}
+}
+
+// applyAllowFrom 统一收口：热替换内存名单 → 落盘 → 回执；落盘失败仅告警
+// 不回滚（内存已生效，回执说明重启后会回退，提示尽快修配置）
+func (e *Engine) applyAllowFrom(p Platform, m AllowFromManager, msg *Message, next, successMsg string) {
+	m.SetAllowFrom(next)
+	slog.Info("audit: allowlist_updated",
+		"user_id", msg.UserID, "platform", p.Name(),
+		"project", e.name, "new_allow_from", next)
+	if e.persistAllowFrom == nil {
+		e.reply(p, msg.ReplyCtx, successMsg+"（⚠️ 未配置落盘，重启后回退）")
+		return
+	}
+	if err := e.persistAllowFrom(p.Name(), next); err != nil {
+		slog.Error("allowlist persist failed", "platform", p.Name(), "error", err)
+		e.reply(p, msg.ReplyCtx, successMsg+fmt.Sprintf("\n⚠️ 写回 config.toml 失败（%v），重启后会回退，请尽快检查", err))
+		return
+	}
+	e.reply(p, msg.ReplyCtx, successMsg)
+}
+
+// extractAllowlistID 从 /allowlist add|remove 的参数中取目标 ID：跳过子命令
+// 词，取首个非空参数（args 可能是 ["add","wohR_xxx"] 也可能是 ["add","=", "wohR_xxx"]）
+func extractAllowlistID(args []string) string {
+	for i, a := range args {
+		if i == 0 {
+			continue // 子命令 add/remove
+		}
+		if s := strings.TrimSpace(a); s != "" && s != "=" {
+			return s
+		}
+	}
+	return ""
+}
+
+// allowFromContains 报告 ID 是否在逗号分隔名单中（大小写不敏感，同 AllowList）
+func allowFromContains(allowFrom, id string) bool {
+	for _, s := range strings.Split(allowFrom, ",") {
+		if strings.EqualFold(strings.TrimSpace(s), strings.TrimSpace(id)) {
+			return true
+		}
+	}
+	return false
+}
+
+// allowFromRemove 从逗号分隔名单中移除 ID（不存在时原样返回原串，
+// 不做 normalize——no-op 语义下改变空格等格式会让调用方误判发生了变更）
+func allowFromRemove(allowFrom, id string) string {
+	if !allowFromContains(allowFrom, id) {
+		return allowFrom
+	}
+	var kept []string
+	for _, s := range strings.Split(allowFrom, ",") {
+		s = strings.TrimSpace(s)
+		if s != "" && !strings.EqualFold(s, strings.TrimSpace(id)) {
+			kept = append(kept, s)
+		}
+	}
+	return strings.Join(kept, ",")
+}
+
+func displayAllowFrom(allowFrom string) string {
+	if strings.TrimSpace(allowFrom) == "" {
+		return "（空 = 放行所有人）"
+	}
+	return allowFrom
+}
+
+// allowlistIntentFromText 识别"人话加白"意图（仅 admin 消息进入本函数）：
+// 含「白名单/allowlist」关键词且不含移除类动词，并从中提取出 ID 形态 token
+// 时返回等价的 "/allowlist add <token>"，否则返回空串（消息正常进 agent）。
+// 提取规则：分词后取首个 [A-Za-z0-9_@.\-]{8,} 的 token——企微混淆 ID
+// （wohR_ 开头）、微信 ilink ID（o9cq…@im.wechat）都满足；普通中文词不满足。
+func allowlistIntentFromText(content string) string {
+	lower := strings.ToLower(content)
+	if !strings.Contains(lower, "白名单") && !strings.Contains(lower, "allowlist") {
+		return ""
+	}
+	// 移除/拒绝类动词：视为 remove 意图或讨论，不自动执行（remove 走显式命令）
+	for _, neg := range []string{"移除", "删除", "踢出", "去掉", "拉黑", "拒绝"} {
+		if strings.Contains(content, neg) {
+			return ""
+		}
+	}
+	fields := strings.Fields(content)
+	for _, f := range fields {
+		// 跳过关键词/子命令自身（"allowlist add xxx" 里 allowlist 也是
+		// 合法的 ID 形态 token，会抢先命中）
+		if strings.EqualFold(f, "allowlist") || strings.EqualFold(f, "add") {
+			continue
+		}
+		if len(f) >= 8 && isIDLikeToken(f) {
+			return "/allowlist add " + f
+		}
+	}
+	return ""
+}
+
+// isIDLikeToken 报告 token 是否像平台用户 ID（仅 ASCII 字母数字与 _ @ . -，
+// 长度 >= 8 已由调用方保证）
+func isIDLikeToken(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '_' || r == '@' || r == '.' || r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ApplyPlatformAllowFrom 按平台类型热应用 allow_from（reloadConfig 补缺口：
+// 名单此前只在 daemon 启动时定格，/config reload 与 management reload 均不刷新）
+func (e *Engine) ApplyPlatformAllowFrom(allowFromByType map[string]string) {
+	for _, p := range e.platforms {
+		m, ok := p.(AllowFromManager)
+		if !ok {
+			continue
+		}
+		if af, ok := allowFromByType[p.Name()]; ok {
+			m.SetAllowFrom(af)
+		}
+	}
 }
 
 func (e *Engine) cmdRestart(p Platform, msg *Message) {

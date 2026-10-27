@@ -953,6 +953,13 @@ func main() {
 			return reloadConfig(configPath, capturedProjName, capturedEngine)
 		})
 
+		// Wire allow_from 持久化（/allowlist 命令热更新后写回 config.toml）
+		engine.SetPersistAllowFromFunc(func(platformName, allowFrom string) error {
+			return config.SaveProjectSettings(capturedProjName, config.ProjectSettingsUpdate{
+				PlatformAllowFrom: map[string]string{platformName: allowFrom},
+			})
+		})
+
 		// Wire /web command callbacks
 		engine.SetWebSetupFunc(func() (int, string, bool, error) {
 			mgmtToken := core.GenerateToken(16)
@@ -1891,6 +1898,18 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	// Reload filter_external_sessions
 	engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
 	engine.SetSessionOwnerFilter(proj.SessionOwnerFilter != nil && *proj.SessionOwnerFilter)
+
+	// Reload platform allow_from：此前只在 daemon 启动时定格（reload 清单不含
+	// platform 层配置），现按平台类型热下发，手动改文件 + /config reload 即生效
+	allowFromByType := make(map[string]string)
+	for _, pl := range proj.Platforms {
+		if typ := strings.TrimSpace(pl.Type); typ != "" {
+			if af, ok := pl.Options["allow_from"].(string); ok {
+				allowFromByType[typ] = af
+			}
+		}
+	}
+	engine.ApplyPlatformAllowFrom(allowFromByType)
 
 	// Reload providers
 	if ps, ok := engine.GetAgent().(core.ProviderSwitcher); ok {

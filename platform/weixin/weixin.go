@@ -323,6 +323,21 @@ func pickBool(v any) bool {
 
 func (p *Platform) Name() string { return "weixin" }
 
+// GetAllowFrom 返回当前准入名单（core.AllowFromManager，/allowlist 命令用）。
+// 复用 mu（通用状态锁）保护 allowFrom，避免再加一把锁。
+func (p *Platform) GetAllowFrom() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.allowFrom
+}
+
+// SetAllowFrom 原子替换准入名单，下一条消息立即生效（/allowlist 热更新）
+func (p *Platform) SetAllowFrom(allowFrom string) {
+	p.mu.Lock()
+	p.allowFrom = strings.TrimSpace(allowFrom)
+	p.mu.Unlock()
+}
+
 func (p *Platform) loadSyncBuf() {
 	if p.syncBufPath == "" {
 		return
@@ -553,7 +568,8 @@ func (p *Platform) dispatchInbound(ctx context.Context, m *weixinMessage, h core
 	if from == "" {
 		return
 	}
-	if !core.AllowList(p.allowFrom, from) {
+	// allowFrom 可被 /allowlist 运行时替换，经锁内快照再判断
+	if !core.AllowList(p.GetAllowFrom(), from) {
 		slog.Debug("weixin: sender not in allow_from", "from", from)
 		return
 	}

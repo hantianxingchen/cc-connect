@@ -17056,3 +17056,154 @@ func TestStartAgentSession_ModeOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// allowFromStubPlatform 记录 allow_from 变更与回复内容，供 /allowlist 测试断言
+type allowFromStubPlatform struct {
+	stubPlatformEngine
+	mu            sync.Mutex
+	allow         string
+	persisted     []string // SetAllowFrom 收到的每次新名单
+	persistErrors error
+}
+
+func (p *allowFromStubPlatform) GetAllowFrom() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.allow
+}
+
+func (p *allowFromStubPlatform) SetAllowFrom(af string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.allow = strings.TrimSpace(af)
+	p.persisted = append(p.persisted, af)
+}
+
+func TestAllowlistIntentFromText(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"加白+ID", "把 wohR_KCgAAabcd1234 加到白名单", "/allowlist add wohR_KCgAAabcd1234"},
+		{"英文关键词", "allowlist add o9cq80wR7E4vcjrI77G6MxMBOim4@im.wechat", "/allowlist add o9cq80wR7E4vcjrI77G6MxMBOim4@im.wechat"},
+		{"无ID不触发", "看一下白名单里都有谁", ""},
+		{"移除动词不触发", "把 wohR_KCgAAabcd1234 从白名单移除", ""},
+		{"无关键词", "加一下 wohR_KCgAAabcd1234", ""},
+		{"短token不算ID", "白名单加上 admin", ""},
+	}
+	for _, c := range cases {
+		if got := allowlistIntentFromText(c.in); got != c.want {
+			t.Errorf("%s: allowlistIntentFromText(%q) = %q, want %q", c.name, c.in, got, c.want)
+		}
+	}
+}
+
+func TestAllowFromHelpers(t *testing.T) {
+	list := "a-1, b-2 ,c-3"
+	if !allowFromContains(list, "B-2") || !allowFromContains(list, "c-3") {
+		t.Fatal("contains should be case-insensitive and whitespace-tolerant")
+	}
+	if allowFromContains(list, "d-4") {
+		t.Fatal("absent ID must not match")
+	}
+	if got := allowFromRemove(list, "b-2"); got != "a-1,c-3" {
+		t.Fatalf("remove b-2 = %q, want a-1,c-3", got)
+	}
+	if got := allowFromRemove(list, "d-4"); got != list {
+		t.Fatalf("remove absent should be no-op, got %q", got)
+	}
+}
+
+func TestCmdAllowlist(t *testing.T) {
+	msg := &Message{UserID: "admin-1"}
+
+	t.Run("add 新 ID", func(t *testing.T) {
+		e := &Engine{}
+		p := &allowFromStubPlatform{allow: "admin-1"}
+		var persisted []string
+		e.SetPersistAllowFromFunc(func(_, af string) error {
+			persisted = append(persisted, af)
+			return nil
+		})
+		e.cmdAllowlist(p, msg, []string{"add", "wohR_new1"})
+		if p.GetAllowFrom() != "admin-1,wohR_new1" {
+			t.Fatalf("allow = %q, want admin-1,wohR_new1", p.GetAllowFrom())
+		}
+		if len(persisted) != 1 || persisted[0] != "admin-1,wohR_new1" {
+			t.Fatalf("persist = %v", persisted)
+		}
+		if len(p.sent) != 1 || !strings.Contains(p.sent[0], "已添加") {
+			t.Fatalf("reply = %v", p.sent)
+		}
+	})
+
+	t.Run("add 已存在", func(t *testing.T) {
+		e := &Engine{}
+		p := &allowFromStubPlatform{allow: "admin-1"}
+		e.cmdAllowlist(p, msg, []string{"add", "admin-1"})
+		if p.GetAllowFrom() != "admin-1" || len(p.persisted) != 0 {
+			t.Fatalf("duplicate add must be no-op: allow=%q persisted=%v", p.GetAllowFrom(), p.persisted)
+		}
+	})
+
+	t.Run("add 到空名单拒绝", func(t *testing.T) {
+		e := &Engine{}
+		p := &allowFromStubPlatform{allow: ""}
+		e.cmdAllowlist(p, msg, []string{"add", "wohR_new1"})
+		if len(p.persisted) != 0 {
+			t.Fatal("empty-list add must not apply")
+		}
+		if len(p.sent) != 1 || !strings.Contains(p.sent[0], "全员放行") {
+			t.Fatalf("reply = %v", p.sent)
+		}
+	})
+
+	t.Run("remove 常规", func(t *testing.T) {
+		e := &Engine{}
+		p := &allowFromStubPlatform{allow: "admin-1,wohR_x"}
+		e.cmdAllowlist(p, msg, []string{"remove", "wohR_x"})
+		if p.GetAllowFrom() != "admin-1" {
+			t.Fatalf("allow = %q, want admin-1", p.GetAllowFrom())
+		}
+	})
+
+	t.Run("remove 最后一条拒绝", func(t *testing.T) {
+		e := &Engine{}
+		p := &allowFromStubPlatform{allow: "admin-1"}
+		e.cmdAllowlist(p, msg, []string{"remove", "admin-1"})
+		if p.GetAllowFrom() != "admin-1" || len(p.persisted) != 0 {
+			t.Fatalf("last-entry remove must be blocked: allow=%q", p.GetAllowFrom())
+		}
+	})
+
+	t.Run("list 回显", func(t *testing.T) {
+		e := &Engine{}
+		p := &allowFromStubPlatform{allow: "admin-1,wohR_x"}
+		e.cmdAllowlist(p, msg, nil)
+		if len(p.sent) != 1 || !strings.Contains(p.sent[0], "admin-1,wohR_x") {
+			t.Fatalf("reply = %v", p.sent)
+		}
+	})
+
+	t.Run("平台未实现 AllowFromManager", func(t *testing.T) {
+		e := &Engine{}
+		p := &stubPlatformEngine{n: "stub"}
+		e.cmdAllowlist(p, msg, []string{"add", "wohR_new1"})
+		if len(p.sent) != 1 || !strings.Contains(p.sent[0], "不支持") {
+			t.Fatalf("reply = %v", p.sent)
+		}
+	})
+}
+
+func TestApplyPlatformAllowFrom(t *testing.T) {
+	e := &Engine{}
+	mgr := &allowFromStubPlatform{stubPlatformEngine: stubPlatformEngine{n: "wecom"}, allow: "old"}
+	plain := &stubPlatformEngine{n: "plain-stub"}
+	e.platforms = []Platform{mgr, plain}
+	e.ApplyPlatformAllowFrom(map[string]string{"wecom": "a,b"})
+	if mgr.GetAllowFrom() != "a,b" {
+		t.Fatalf("manager allow = %q, want a,b", mgr.GetAllowFrom())
+	}
+	if len(mgr.persisted) != 1 {
+		t.Fatalf("SetAllowFrom should be called once, got %v", mgr.persisted)
+	}
+}

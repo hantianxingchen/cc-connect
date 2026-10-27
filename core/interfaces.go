@@ -386,6 +386,15 @@ type SessionModeStarter interface {
 	StartSessionWithMode(ctx context.Context, sessionID string, mode string) (AgentSession, error)
 }
 
+// AllowFromManager is implemented by platforms whose allow_from admission list
+// can be updated at runtime (the /allowlist command). GetAllowFrom returns the
+// current comma-separated list; SetAllowFrom atomically replaces it and takes
+// effect for the very next inbound message — no daemon restart needed.
+type AllowFromManager interface {
+	GetAllowFrom() string
+	SetAllowFrom(allowFrom string)
+}
+
 // AgentSession represents a running interactive agent session with a persistent process.
 type AgentSession interface {
 	// Send sends a user message (with optional images and files) to the running

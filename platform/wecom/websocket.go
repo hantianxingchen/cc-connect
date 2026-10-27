@@ -49,6 +49,9 @@ type WSPlatform struct {
 	// 防好奇用户连发刷屏管理员
 	notifyMu   sync.Mutex
 	lastNotify map[string]time.Time
+	// allowFrom 运行时可变（/allowlist 命令热更新准入名单），allowMu 保护；
+	// 与 conn 写锁（mu）分离避免读写名单阻塞消息发送
+	allowMu sync.RWMutex
 }
 
 const (
@@ -158,6 +161,22 @@ func (p *WSPlatform) SetAdminFrom(adminFrom string) {
 	p.notifyMu.Lock()
 	p.adminFrom = strings.TrimSpace(adminFrom)
 	p.notifyMu.Unlock()
+}
+
+// GetAllowFrom 返回当前准入名单（core.AllowFromManager，/allowlist 命令用）
+func (p *WSPlatform) GetAllowFrom() string {
+	p.allowMu.RLock()
+	defer p.allowMu.RUnlock()
+	return p.allowFrom
+}
+
+// SetAllowFrom 原子替换准入名单，下一条入站消息立即生效（/allowlist 热更新，
+// 免 daemon restart——allow_from 不在 config reload 热加载清单内的缺口由
+// engine 的 reloadConfig 补调本方法）
+func (p *WSPlatform) SetAllowFrom(allowFrom string) {
+	p.allowMu.Lock()
+	p.allowFrom = strings.TrimSpace(allowFrom)
+	p.allowMu.Unlock()
 }
 
 // generateReqID creates a unique req_id with the given prefix (e.g. "ping_1", "aibot_subscribe_2").
@@ -417,7 +436,8 @@ func (p *WSPlatform) handleMsgCallback(frame wsFrame) {
 		userID:   body.From.UserID,
 	}
 
-	if !core.AllowList(p.allowFrom, body.From.UserID) {
+	// allowFrom 可被 /allowlist 运行时替换，经 allowMu 读快照再判断
+	if !core.AllowList(p.GetAllowFrom(), body.From.UserID) {
 		slog.Info("wecom-ws: message from unauthorized user", "user", body.From.UserID,
 			"chat_type", body.ChatType, "msg_id", body.MsgID)
 		// 回执带 userID：WS 模式协议只下发混淆 ID、不解析名字，
