@@ -89,11 +89,14 @@ func (m *launchdManager) Uninstall() error {
 
 func (*launchdManager) Start() error {
 	if _, target, _, ok := loadedLaunchdTarget(); ok {
-		out, err := runLaunchctl("kickstart", "-kp", target)
-		if err != nil {
-			return fmt.Errorf("start: %s (%w)", out, err)
+		if _, err := runLaunchctl("kickstart", "-kp", target); err == nil {
+			return nil
 		}
-		return nil
+		// Fall through to bootstrap instead of returning the kickstart error:
+		// right after Stop()'s bootout, launchctl print can still report the
+		// service as loaded while kickstart fails with "Could not find
+		// service" (exit 113) — the stale view must not strand the daemon
+		// offline. bootstrap re-registers the plist and recovers.
 	}
 
 	domain := preferredLaunchdDomain()
