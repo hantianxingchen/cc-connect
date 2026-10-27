@@ -475,6 +475,15 @@ type Engine struct {
 	sendWorkDirMu                sync.RWMutex
 	sendWorkDirs                 map[string]string // sessionKey → work_dir assigned by send --cwd
 
+	// session_owner_filter：多用户共享单 project（bot 场景）时，
+	// /list /switch /delete 按会话归属过滤，独立于 multiWorkspace 生效
+	sessionOwnerFilter bool
+	// admin 会话登记：admin 用户的消息进入时记录 sessionKey，
+	// 供卡片动作等无 userID 的回调路径（act:/mode yolo）判断 admin 身份。
+	// 只有 admin 的会话会进表，量级为个位数，无需淘汰策略
+	adminSessions   map[string]bool
+	adminSessionsMu sync.Mutex
+
 	// Terminal observation (--observe)
 	observeEnabled    bool
 	observeProjectDir string // ~/.claude/projects/{projectKey}
@@ -1045,6 +1054,12 @@ func (e *Engine) SetFilterExternalSessions(v bool) {
 	e.filterExternalSessions = v
 }
 
+// SetSessionOwnerFilter 启用后 /list /switch /delete 只暴露当前会话归属的
+// 会话（applySessionFilter），供多用户共享单 project 的 bot 场景使用。
+func (e *Engine) SetSessionOwnerFilter(v bool) {
+	e.sessionOwnerFilter = v
+}
+
 func (e *Engine) SetWebSetupFunc(fn func() (int, string, bool, error)) { e.webSetupFunc = fn }
 func (e *Engine) SetWebStatusFunc(fn func() string)                    { e.webStatusFunc = fn }
 
@@ -1264,6 +1279,13 @@ func (e *Engine) SetAdminFrom(adminFrom string) {
 	af := e.adminFrom
 	shellDisabled := e.disabledCmds["shell"]
 	e.userRolesMu.Unlock()
+	// 把 admin 名单下发给支持的平台（如 wecom-ws 的未授权访问通知），
+	// 保持 admin_from 单一配置来源，平台无需重复配置
+	for _, p := range e.platforms {
+		if r, ok := p.(AdminFromReceiver); ok {
+			r.SetAdminFrom(af)
+		}
+	}
 	if af == "" && !shellDisabled {
 		slog.Warn("admin_from is not set — privileged commands (/shell, /show, /dir, /restart, /upgrade) are blocked. "+
 			"Set admin_from in config to enable them, or use disabled_commands to hide them.",
@@ -1318,6 +1340,17 @@ func isPrivilegedCommandInvocation(cmdID string, args []string) bool {
 	}
 }
 
+// isApproveAllMode 报告 mode key 是否等效"全部自动批准"（跳过权限确认）。
+// SetMode 改的是 agent 级默认（后续新会话全部生效），所以此类档位必须
+// 与 admin 门禁绑定。
+func isApproveAllMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "yolo", "bypass", "bypasspermissions", "dangerfullaccess":
+		return true
+	}
+	return false
+}
+
 // isAdmin checks whether the given user ID is authorized for privileged commands.
 // Unlike AllowList, empty adminFrom means deny-all (fail-closed).
 func (e *Engine) isAdmin(userID string) bool {
@@ -1336,6 +1369,38 @@ func (e *Engine) isAdmin(userID string) bool {
 		}
 	}
 	return false
+}
+
+// adminFromConfigured 报告是否配置了 admin_from。approveAll 类门禁是
+// opt-in 语义：未配置视为单用户部署，保持旧行为；配置即多人化部署，
+// approveAll 类模式与短语仅 admin 可用。
+func (e *Engine) adminFromConfigured() bool {
+	e.userRolesMu.RLock()
+	defer e.userRolesMu.RUnlock()
+	return e.adminFrom != ""
+}
+
+// markAdminSession 在 admin 用户的消息进入时登记其 sessionKey，供卡片动作
+// 等只带 sessionKey、不带 userID 的回调路径判断 admin 身份（isAdminSession）。
+func (e *Engine) markAdminSession(sessionKey, userID string) {
+	if !e.isAdmin(userID) {
+		return
+	}
+	e.adminSessionsMu.Lock()
+	if e.adminSessions == nil {
+		e.adminSessions = make(map[string]bool)
+	}
+	e.adminSessions[sessionKey] = true
+	e.adminSessionsMu.Unlock()
+}
+
+// isAdminSession 报告该 sessionKey 是否由 admin 用户活跃使用。admin 尚未
+// 在本进程生命周期内发过消息时表内无记录——此时对 admin 也会误判为非
+// admin，fail-closed 方向的安全误判，admin 发条消息即恢复。
+func (e *Engine) isAdminSession(sessionKey string) bool {
+	e.adminSessionsMu.Lock()
+	defer e.adminSessionsMu.Unlock()
+	return e.adminSessions[sessionKey]
 }
 
 // SetBannedWords replaces the banned words list.
@@ -3002,6 +3067,10 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		Content:    msg.Content,
 	})
 
+	// 登记 admin 活跃会话，供卡片动作（act:/mode yolo）等无 userID 的
+	// 回调路径做 admin 门禁判断（见 isAdminSession）
+	e.markAdminSession(msg.SessionKey, msg.UserID)
+
 	// Voice message: transcribe to text first
 	if msg.Audio != nil {
 		// If STT is configured, use it for transcription (more accurate)
@@ -3700,8 +3769,15 @@ found:
 	lower := strings.ToLower(strings.TrimSpace(content))
 
 	if isApproveAllResponse(lower) {
+		// approveAll 仅 admin 可置位（opt-in：admin_from 未配置=单用户部署
+		// 保持旧行为）：置位后该会话所有后续权限请求全部静默放行，
+		// 非 admin 若可置位即等于自授全权限。非 admin 发"全部允许"类
+		// 回复时仍放行当前这一次请求（与单次 allow 等价），但不置
+		// approveAll，后续权限请求继续弹窗确认
 		state.mu.Lock()
-		state.approveAll = true
+		if !e.adminFromConfigured() || e.isAdmin(msg.UserID) {
+			state.approveAll = true
+		}
 		state.mu.Unlock()
 
 		if err := state.agentSession.RespondPermission(pending.RequestID, PermissionResult{
@@ -7229,6 +7305,18 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		return true
 	}
 
+	// approveAll 类模式（/mode yolo 等）单独门禁：与特权命令不同，
+	// admin_from 未配置时视为单用户部署、保持旧行为（opt-in）；
+	// 配置了 admin_from 即多人化部署，此类模式仅 admin 可切
+	if cmdID == "mode" && len(args) > 0 && isApproveAllMode(args[0]) &&
+		e.adminFromConfigured() && !e.isAdmin(msg.UserID) {
+		slog.Info("audit: command_blocked",
+			"user_id", msg.UserID, "platform", msg.Platform,
+			"project", e.name, "command", "mode", "reason", "approve_all_mode")
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAdminRequired), "/mode "+args[0]))
+		return true
+	}
+
 	if cmdID != "" {
 		slog.Info("audit: command_executed",
 			"user_id", msg.UserID, "platform", msg.Platform,
@@ -7652,12 +7740,17 @@ func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
 // IDs, and its "empty means pass through" escape hatch keeps the filter inert
 // until every session has a tracked ID.
 //
-// Outside multi-workspace mode the agent's list is returned unchanged.
+// session_owner_filter extends the same narrowing to single-workspace bots
+// shared by multiple users (all sessions land in one work_dir): without it a
+// non-admin user can /list and /switch into other users' private sessions.
+//
+// Outside multi-workspace mode (and with session_owner_filter unset) the
+// agent's list is returned unchanged.
 func (e *Engine) applySessionFilter(sessions []AgentSessionInfo, sm *SessionManager, sessionKey string) []AgentSessionInfo {
 	if e.filterExternalSessions {
 		sessions = filterOwnedSessions(sessions, sm.KnownAgentSessionIDs())
 	}
-	if !e.multiWorkspace || sm == nil || sessionKey == "" {
+	if (!e.multiWorkspace && !e.sessionOwnerFilter) || sm == nil || sessionKey == "" {
 		return sessions
 	}
 	// A nil map means the store predates ID tracking, so ownership cannot be
@@ -13026,6 +13119,14 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 			return
 		}
 		newMode := strings.ToLower(args)
+		// 卡片动作不带 userID，用 admin 会话登记表判断；approveAll 类档位
+		// 仅 admin 可切（admin_from 未配置=单用户部署，保持旧行为），
+		// 非 admin 静默忽略
+		if isApproveAllMode(newMode) && e.adminFromConfigured() && !e.isAdminSession(sessionKey) {
+			slog.Info("audit: card_mode_blocked",
+				"session", sessionKey, "mode", newMode, "reason", "unauthorized")
+			return
+		}
 		switcher.SetMode(newMode)
 		if e.applyLiveModeChange(sessionKey, switcher.GetMode()) {
 			e.cleanupInteractiveState(interactiveKey)

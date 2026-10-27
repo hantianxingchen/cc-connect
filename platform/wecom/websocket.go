@@ -38,6 +38,17 @@ type WSPlatform struct {
 	reqSeq      atomic.Int64 // monotonic counter for generating unique req_id
 	missedPong  atomic.Int32 // consecutive heartbeat acks not received
 	pendingAcks sync.Map     // req_id -> chan wsAckResult, for sequential send with ack waiting
+
+	// 群共享会话：群内所有人 @ bot 进同一个会话（sessionKey 去 userID 段），
+	// 上下文互通；默认 false 保持每用户独立会话的旧行为
+	groupSharedSessions bool
+	// adminFrom 由 engine 注入（SetAdminFrom，core.AdminFromReceiver），
+	// 未授权用户被 allowFrom 拦截时 proactive Send 通知这些管理员
+	adminFrom string
+	// 未授权通知去重：adminID|userID -> 上次通知时间；同一对 1 小时至多一条，
+	// 防好奇用户连发刷屏管理员
+	notifyMu   sync.Mutex
+	lastNotify map[string]time.Time
 }
 
 const (
@@ -130,13 +141,23 @@ func newWebSocket(opts map[string]any) (core.Platform, error) {
 	if wsURL == "" {
 		wsURL = wsEndpoint
 	}
+	groupShared, _ := opts["group_shared_sessions"].(bool)
 
 	return &WSPlatform{
-		botID:     botID,
-		secret:    secret,
-		allowFrom: allowFrom,
-		wsURL:     wsURL,
+		botID:               botID,
+		secret:              secret,
+		allowFrom:           allowFrom,
+		wsURL:               wsURL,
+		groupSharedSessions: groupShared,
 	}, nil
+}
+
+// SetAdminFrom implements core.AdminFromReceiver. adminFrom 为逗号分隔的
+// 管理员 userID 列表；engine 装配时注入，未授权访问通知按此列表推送。
+func (p *WSPlatform) SetAdminFrom(adminFrom string) {
+	p.notifyMu.Lock()
+	p.adminFrom = strings.TrimSpace(adminFrom)
+	p.notifyMu.Unlock()
 }
 
 // generateReqID creates a unique req_id with the given prefix (e.g. "ping_1", "aibot_subscribe_2").
@@ -397,14 +418,25 @@ func (p *WSPlatform) handleMsgCallback(frame wsFrame) {
 	}
 
 	if !core.AllowList(p.allowFrom, body.From.UserID) {
-		slog.Debug("wecom-ws: message from unauthorized user", "user", body.From.UserID)
-		if err := p.Reply(context.Background(), rctx, core.UnauthorizedAccessMessage); err != nil {
+		slog.Info("wecom-ws: message from unauthorized user", "user", body.From.UserID,
+			"chat_type", body.ChatType, "msg_id", body.MsgID)
+		// 回执带 userID：WS 模式协议只下发混淆 ID、不解析名字，
+		// 混淆 ID 正是申请 allowFrom 需要的凭证，引导用户转交给管理员
+		if err := p.Reply(context.Background(), rctx,
+			fmt.Sprintf("%s\n\n您的申请 ID: %s", core.UnauthorizedAccessMessage, body.From.UserID)); err != nil {
 			slog.Warn("wecom-ws: unauthorized reply failed", "error", err)
 		}
+		p.notifyUnauthorizedAdmins(&body)
 		return
 	}
 
 	sessionKey := fmt.Sprintf("wecom:%s:%s", chatID, body.From.UserID)
+	if p.groupSharedSessions && body.ChatType == "group" {
+		// 群共享会话：第三段固定 "group"（保持三段格式，
+		// sessionKeyToReplyContext 的 parts 切分与 ReconstructReplyCtx 兼容）。
+		// 群内所有人 @ 进同一会话上下文互通；owner 过滤按 chatID 天然隔离群外。
+		sessionKey = fmt.Sprintf("wecom:%s:group", chatID)
+	}
 
 	// WS mode does not provide display names; the protocol only carries userID.
 	// Name resolution would require a separate HTTP API call with corpSecret,
@@ -471,6 +503,61 @@ func (p *WSPlatform) handleMsgCallback(frame wsFrame) {
 // The stream content field is a full-replacement (not incremental append), so we
 // send the complete content in one frame with finish=true.
 // Markdown is natively supported by the stream reply format.
+// notifyUnauthorizedAdmins 把未授权访问事件 proactive Send 推送给 adminFrom
+// 名单里的管理员（私聊场景 admin 的 userID 即其 chatID）。管理员拿混淆 ID
+// 即可决定是否将该用户加入 allow_from。同一 adminID|userID 对 1 小时内至多
+// 一条通知，防止好奇用户连发刷屏。发送失败只记日志，不影响拦截主流程。
+func (p *WSPlatform) notifyUnauthorizedAdmins(body *wsMsgCallbackBody) {
+	admins := strings.Split(p.adminFrom, ",")
+	if len(admins) == 0 {
+		return
+	}
+	now := time.Now()
+	for _, admin := range admins {
+		admin = strings.TrimSpace(admin)
+		// "*" 全员 admin 时无具体通知目标；被拦者本人是 admin 不会发生（在 allow_from 内）
+		if admin == "" || admin == "*" || admin == body.From.UserID {
+			continue
+		}
+		dedupKey := admin + "|" + body.From.UserID
+		p.notifyMu.Lock()
+		if t, ok := p.lastNotify[dedupKey]; ok && now.Sub(t) < time.Hour {
+			p.notifyMu.Unlock()
+			continue
+		}
+		if p.lastNotify == nil {
+			p.lastNotify = make(map[string]time.Time)
+		}
+		p.lastNotify[dedupKey] = now
+		p.notifyMu.Unlock()
+
+		source := "私聊"
+		if body.ChatType == "group" {
+			source = fmt.Sprintf("群聊（%s）", body.ChatID)
+		}
+		content := fmt.Sprintf("⚠️ 未授权访问\n用户：%s\n来源：%s\n时间：%s\n内容：「%s」",
+			body.From.UserID, source, now.Format("2006-01-02 15:04"),
+			truncRunes(body.Text.Content, 80))
+		// 异步发送：Send 最坏等 ack 超时（5s/管理员），不该阻塞拦截主流程；
+		// 私聊场景 chatID 回落到 userID（见 handleMsgCallback），
+		// 故直接用 admin userID 构造发送上下文
+		go func(admin, content string) {
+			if err := p.Send(context.Background(), wsReplyContext{chatID: admin}, content); err != nil {
+				slog.Warn("wecom-ws: unauthorized access notify failed", "admin", admin, "error", err)
+			}
+		}(admin, content)
+	}
+}
+
+// truncRunes 按 rune 截断字符串，超长补省略号（通知内容预览用）。
+func truncRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
 func (p *WSPlatform) Reply(ctx context.Context, rctx any, content string) error {
 	rc, ok := rctx.(wsReplyContext)
 	if !ok {

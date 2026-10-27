@@ -568,6 +568,11 @@ type ProjectConfig struct {
 	// cc-connect, hiding sessions created by direct CLI usage in the same work_dir.
 	// Default is false (show all sessions).
 	FilterExternalSessions *bool `toml:"filter_external_sessions,omitempty"`
+	// SessionOwnerFilter: when true, /list /switch /delete only expose sessions
+	// owned by the requesting conversation even outside multi-workspace mode.
+	// Needed when multiple users share one project (bot scenario) so a user
+	// cannot see or switch into another user's sessions.
+	SessionOwnerFilter *bool `toml:"session_owner_filter,omitempty"`
 	// Shell overrides the global shell for this project. See Config.Shell.
 	Shell string `toml:"shell,omitempty"`
 	// ShellProfile overrides the global shell_profile for this project.

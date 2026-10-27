@@ -16856,3 +16856,103 @@ func TestProcessInteractiveEvents_ProgressUpdateFailurePreservesFinalReply(t *te
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Multi-user bot scenario: session_owner_filter + approveAll gating
+// ---------------------------------------------------------------------------
+
+func TestApplySessionFilter_SessionOwnerFilterWithoutMultiWorkspace(t *testing.T) {
+	sm := NewSessionManager("")
+	// 两个用户各建一个会话并绑定 agent session ID（owner 归属由此推导）
+	alice := sm.GetOrCreateActive("wecom:chat1:alice")
+	alice.SetAgentSessionID("agent-alice", "claudecode")
+	bob := sm.GetOrCreateActive("wecom:chat1:bob")
+	bob.SetAgentSessionID("agent-bob", "claudecode")
+
+	all := []AgentSessionInfo{
+		{ID: "agent-alice"},
+		{ID: "agent-bob"},
+		{ID: "agent-cli"}, // 无归属：直接 CLI 建的会话
+	}
+
+	// 开关关闭（旧行为）：非 multiWorkspace 不做归属过滤，全部可见
+	e := &Engine{}
+	if got := e.applySessionFilter(all, sm, "wecom:chat1:alice"); len(got) != 3 {
+		t.Fatalf("owner filter off: got %d sessions, want 3 (unchanged)", len(got))
+	}
+
+	// 开关开启（多用户共享单 project 的 bot 场景）：alice 只看到自己的
+	// 会话；无归属的（CLI 建，由 filter_external_sessions 另行处理）保留
+	e.SetSessionOwnerFilter(true)
+	got := e.applySessionFilter(all, sm, "wecom:chat1:alice")
+	if len(got) != 2 {
+		t.Fatalf("owner filter on: got %d sessions, want 2", len(got))
+	}
+	seen := map[string]bool{}
+	for _, s := range got {
+		seen[s.ID] = true
+	}
+	if !seen["agent-alice"] || seen["agent-bob"] {
+		t.Fatalf("owner filter on: wrong sessions visible: %v", got)
+	}
+}
+
+func TestIsApproveAllMode(t *testing.T) {
+	for _, m := range []string{"yolo", "YOLO", "bypass", "bypassPermissions", " dangerFullAccess "} {
+		if !isApproveAllMode(m) {
+			t.Fatalf("isApproveAllMode(%q) = false, want true", m)
+		}
+	}
+	for _, m := range []string{"default", "plan", "", "acceptEdits"} {
+		if isApproveAllMode(m) {
+			t.Fatalf("isApproveAllMode(%q) = true, want false", m)
+		}
+	}
+}
+
+func TestExecuteCardAction_ApproveAllModeGatedByAdmin(t *testing.T) {
+	sessionKey := "feishu:channel1:user1"
+
+	// 多人化部署（配置了 admin_from）：非 admin 会话的 yolo 卡片动作被
+	// 静默忽略；admin 会话（已登记）正常生效
+	e := NewEngine("test", &stubModelModeAgent{mode: "default"},
+		[]Platform{&stubPlatformEngine{n: "plain"}}, "", LangEnglish)
+	e.SetAdminFrom("admin-1")
+
+	e.executeCardAction("/mode", "yolo", sessionKey)
+	if e.agent.(*stubModelModeAgent).mode != "default" {
+		t.Fatal("yolo card action from non-admin session should be ignored")
+	}
+
+	e.markAdminSession(sessionKey, "admin-1")
+	e.executeCardAction("/mode", "yolo", sessionKey)
+	if e.agent.(*stubModelModeAgent).mode != "yolo" {
+		t.Fatal("yolo card action from admin session should apply")
+	}
+
+	// admin_from 未配置（单用户部署）：opt-in 语义，保持旧行为不拦
+	e2 := NewEngine("test", &stubModelModeAgent{mode: "default"},
+		[]Platform{&stubPlatformEngine{n: "plain"}}, "", LangEnglish)
+	e2.executeCardAction("/mode", "yolo", sessionKey)
+	if e2.agent.(*stubModelModeAgent).mode != "yolo" {
+		t.Fatal("yolo card action should apply when admin_from is unset (single-user)")
+	}
+}
+
+func TestAdminSessionRegistry(t *testing.T) {
+	e := &Engine{}
+	e.SetAdminFrom("admin-1")
+	if e.isAdminSession("wecom:chat:admin-1") {
+		t.Fatal("unregistered session must not count as admin")
+	}
+	// admin 发过消息的会话被登记
+	e.markAdminSession("wecom:chat:admin-1", "admin-1")
+	if !e.isAdminSession("wecom:chat:admin-1") {
+		t.Fatal("registered admin session should pass")
+	}
+	// 非 admin 用户的消息不登记（fail-closed）
+	e.markAdminSession("wecom:chat:bob", "bob")
+	if e.isAdminSession("wecom:chat:bob") {
+		t.Fatal("non-admin session must not be registered")
+	}
+}

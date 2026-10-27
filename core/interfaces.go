@@ -54,6 +54,14 @@ type ReplyContextReconstructor interface {
 	ReconstructReplyCtx(sessionKey string) (any, error)
 }
 
+// AdminFromReceiver is an optional interface for platforms that want the
+// project's admin_from list — e.g. wecom-ws proactively notifies admins when
+// a user not in allow_from attempts to use the bot. The engine injects the
+// value via SetAdminFrom whenever SetAdminFrom is called on the engine.
+type AdminFromReceiver interface {
+	SetAdminFrom(adminFrom string)
+}
+
 // RelayGroupVisibilityTarget is an optional interface for platforms that
 // want to customise the session key used when echoing relay request /
 // response messages into the group chat for visibility.  Platforms that

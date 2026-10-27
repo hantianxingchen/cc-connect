@@ -317,8 +317,14 @@ func TestHandleMsgCallback_RepliesToUnauthorizedSender(t *testing.T) {
 			serverDone <- fmt.Errorf("cmd = %q, want aibot_respond_msg", frame.Cmd)
 			return
 		}
-		if got := body.Stream.Content; got != core.UnauthorizedAccessMessage {
-			serverDone <- fmt.Errorf("content = %q, want %q", got, core.UnauthorizedAccessMessage)
+		// 回执在通用文案后附申请 ID（混淆 userID 即申请 allow_from 的凭证）
+		got := body.Stream.Content
+		if !strings.HasPrefix(got, core.UnauthorizedAccessMessage) {
+			serverDone <- fmt.Errorf("content = %q, want prefix %q", got, core.UnauthorizedAccessMessage)
+			return
+		}
+		if !strings.Contains(got, "blocked-user") {
+			serverDone <- fmt.Errorf("content = %q, want it to contain the requesting user ID", got)
 			return
 		}
 		serverDone <- nil
@@ -1139,5 +1145,180 @@ func TestNewWebSocket_BlankWSEndpointFallsBack(t *testing.T) {
 	ws := p.(*WSPlatform)
 	if ws.wsURL != wsEndpoint {
 		t.Fatalf("expected blank ws_url to fall back to %q, got %q", wsEndpoint, ws.wsURL)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// group_shared_sessions：群内所有人共享同一个会话
+// ---------------------------------------------------------------------------
+
+func TestHandleMsgCallback_GroupSharedSessions_SameKeyForAllUsers(t *testing.T) {
+	p, captured := newCapturedWSPlatform()
+	p.groupSharedSessions = true
+
+	for _, tc := range []struct{ msgID, user string }{
+		{"msg_g1", "zhangsan"},
+		{"msg_g2", "lisi"},
+	} {
+		body := wsMsgCallbackBody{
+			MsgID:    tc.msgID,
+			ChatID:   "group_chat_id_123",
+			ChatType: "group",
+			MsgType:  "text",
+		}
+		body.From.UserID = tc.user
+		body.Text.Content = "hi group from " + tc.user
+		body.CreateTime = time.Now().Unix()
+		p.handleMsgCallback(wsCallbackFrame(t, "req_"+tc.msgID, body))
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case msg := <-captured:
+			// 第三段固定 "group"：群内不同 @ 者进同一会话，上下文互通；
+			// 三段格式保持 sessionKeyToReplyCtx / ReconstructReplyCtx 兼容
+			if msg.SessionKey != "wecom:group_chat_id_123:group" {
+				t.Fatalf("msg %d: expected shared sessionKey 'wecom:group_chat_id_123:group', got %q", i, msg.SessionKey)
+			}
+			rc := msg.ReplyCtx.(wsReplyContext)
+			if rc.chatID != "group_chat_id_123" {
+				t.Fatalf("msg %d: expected chatID 'group_chat_id_123', got %q", i, rc.chatID)
+			}
+		case <-time.After(1 * time.Second):
+			t.Fatal("handler not called")
+		}
+	}
+}
+
+func TestHandleMsgCallback_GroupSharedSessions_PrivateChatUnaffected(t *testing.T) {
+	p, captured := newCapturedWSPlatform()
+	p.groupSharedSessions = true
+
+	// 私聊不受群共享影响：仍按 userID 隔离（B1 owner 过滤依赖此区分归属）
+	body := wsMsgCallbackBody{
+		MsgID:    "msg_p1",
+		ChatID:   "",
+		ChatType: "single",
+		MsgType:  "text",
+	}
+	body.From.UserID = "zhangsan"
+	body.Text.Content = "private hello"
+	body.CreateTime = time.Now().Unix()
+	p.handleMsgCallback(wsCallbackFrame(t, "req_msg_p1", body))
+
+	select {
+	case msg := <-captured:
+		if msg.SessionKey != "wecom:zhangsan:zhangsan" {
+			t.Fatalf("private chat sessionKey = %q, want wecom:zhangsan:zhangsan", msg.SessionKey)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("handler not called")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 未授权访问通知：通知 admin_from（带混淆 ID 与消息预览），同用户 1 小时去重
+// ---------------------------------------------------------------------------
+
+func TestNotifyUnauthorizedAdmins_SendsAndDedups(t *testing.T) {
+	var mu sync.Mutex
+	var sends []map[string]any // 收到的 aibot_send_msg 帧
+
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for {
+			var frame map[string]any
+			if err := conn.ReadJSON(&frame); err != nil {
+				return
+			}
+			if cmd, _ := frame["cmd"].(string); cmd == "aibot_send_msg" {
+				mu.Lock()
+				sends = append(sends, frame)
+				mu.Unlock()
+			}
+			headers, _ := frame["headers"].(map[string]any)
+			reqID, _ := headers["req_id"].(string)
+			ack := map[string]any{
+				"headers": map[string]any{"req_id": reqID},
+				"errcode": 0,
+				"errmsg":  "ok",
+			}
+			if err := conn.WriteJSON(ack); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + server.URL[len("http"):]
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial test websocket: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	p := &WSPlatform{allowFrom: "allowed-user", conn: conn}
+	p.SetAdminFrom("admin-1")
+	// 模拟连接读循环：分发 server 回的 ack 给 pendingAcks
+	go func() {
+		for {
+			var frame wsFrame
+			if err := conn.ReadJSON(&frame); err != nil {
+				return
+			}
+			p.handleFrame(frame)
+		}
+	}()
+
+	sendBlocked := func(msgID, content string) {
+		body := wsMsgCallbackBody{MsgID: msgID, ChatType: "single", MsgType: "text"}
+		body.From.UserID = "stranger"
+		body.Text.Content = content
+		body.CreateTime = time.Now().Unix()
+		p.handleMsgCallback(wsCallbackFrame(t, "req_"+msgID, body))
+	}
+
+	sendBlocked("m1", "帮我看看这个报错")
+	// 通知是异步 Send：轮询等首条落地
+	waitForSends := func(want int) bool {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			n := len(sends)
+			mu.Unlock()
+			if n == want {
+				return true
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return false
+	}
+	if !waitForSends(1) {
+		t.Fatal("first unauthorized notification not sent to admin")
+	}
+
+	// 同一用户 1 小时内第二条被去重：不再通知
+	sendBlocked("m2", "再试一次")
+	time.Sleep(300 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sends) != 1 {
+		t.Fatalf("expected dedup to keep send count at 1, got %d", len(sends))
+	}
+
+	body, _ := sends[0]["body"].(map[string]any)
+	if body["chatid"] != "admin-1" {
+		t.Fatalf("notify chatid = %v, want admin-1", body["chatid"])
+	}
+	// JSON 反序列化后 markdown 是 map[string]any（值不是 string）
+	md, _ := body["markdown"].(map[string]any)
+	content, _ := md["content"].(string)
+	if !strings.Contains(content, "stranger") || !strings.Contains(content, "帮我看看这个报错") {
+		t.Fatalf("notify content missing user ID or preview: %q", content)
 	}
 }
