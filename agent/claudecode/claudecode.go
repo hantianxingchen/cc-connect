@@ -547,11 +547,85 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 // sessions). Empty mode uses a.mode; non-empty values go through
 // normalizePermissionMode, so user-friendly aliases (e.g. "yolo") are accepted.
 func (a *Agent) StartSessionWithMode(ctx context.Context, sessionID string, modeOverride string) (core.AgentSession, error) {
+	return a.startSessionLocked(ctx, sessionID, modeOverride, nil)
+}
+
+// StartSessionWithOverrides 扩展 mode 注入：同时支持 guest skill 白名单
+// （engine 的 guest_allowed_skills，非 admin/群聊会话）。白名单非空时读
+// skills 目录（CLAUDE_CONFIG_DIR/skills，bot 实例独立 home）diff 出白名单外
+// 的 skill 生成 Skill(skill:X) deny 规则，追加到 disallowedTools 注入 spawn。
+// 白名单为空 = 无限制（admin 会话全量可用）。目录读不到时宽松回落（只记
+// 日志不禁），避免目录异常把 guest 会话锁死。
+func (a *Agent) StartSessionWithOverrides(ctx context.Context, sessionID string, modeOverride string, guestAllowedSkills []string) (core.AgentSession, error) {
+	if len(guestAllowedSkills) == 0 {
+		return a.startSessionLocked(ctx, sessionID, modeOverride, nil)
+	}
+	a.mu.Lock()
+	env := a.runtimeEnvLocked()
+	a.mu.Unlock()
+	var deny []string
+	if configDir := envValue(env, "CLAUDE_CONFIG_DIR"); configDir != "" {
+		deny = guestSkillDenyRules(filepath.Join(configDir, "skills"), guestAllowedSkills)
+	} else {
+		slog.Warn("claudecode: CLAUDE_CONFIG_DIR not set; guest skill whitelist skipped",
+			"session_id", sessionID)
+	}
+	return a.startSessionLocked(ctx, sessionID, modeOverride, deny)
+}
+
+// guestSkillDenyRules 由 skills 目录与白名单 diff 出禁用的 skill，生成
+// Skill(skill:X) deny 规则（CC 的 Skill 级权限规则，无视调用形态直接拦）。
+// 白名单外的所有目录（含软链）都算 skill——未来新增的 skill 默认对 guest
+// 禁用，需显式加白。目录不可读返回 nil（宽松回落）。
+func guestSkillDenyRules(skillsDir string, allowed []string) []string {
+	entries, err := os.ReadDir(skillsDir)
+	if err != nil {
+		slog.Warn("claudecode: cannot read skills dir; guest skill whitelist not enforced",
+			"dir", skillsDir, "err", err)
+		return nil
+	}
+	allowedSet := make(map[string]bool, len(allowed))
+	for _, s := range allowed {
+		allowedSet[strings.TrimSpace(s)] = true
+	}
+	var rules []string
+	for _, e := range entries {
+		name := e.Name()
+		if allowedSet[name] {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		// 目录或指向目录的软链都视为 skill（bot 的 skills 目录本身是软链）
+		if info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			rules = append(rules, "Skill(skill:"+name+")")
+		}
+	}
+	return rules
+}
+
+// envValue 从 "K=V" 形态的 env 切片取值（后出现的优先）。
+func envValue(env []string, key string) string {
+	val := ""
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			val = v
+		}
+	}
+	return val
+}
+
+// startSessionLocked 是 StartSessionWithMode/WithOverrides 的共同主体：
+// extraDeny 非空时追加到 agent 级 disallowedTools 一起注入 spawn。
+func (a *Agent) startSessionLocked(ctx context.Context, sessionID string, modeOverride string, extraDeny []string) (core.AgentSession, error) {
 	a.mu.Lock()
 	tools := make([]string, len(a.allowedTools))
 	copy(tools, a.allowedTools)
-	disTools := make([]string, len(a.disallowedTools))
-	copy(disTools, a.disallowedTools)
+	disTools := make([]string, 0, len(a.disallowedTools)+len(extraDeny))
+	disTools = append(disTools, a.disallowedTools...)
+	disTools = append(disTools, extraDeny...)
 	maxTok := a.maxContextTokens
 	ctxWin := a.contextWindowTokens
 	model := a.model

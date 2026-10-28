@@ -386,6 +386,17 @@ type SessionModeStarter interface {
 	StartSessionWithMode(ctx context.Context, sessionID string, mode string) (AgentSession, error)
 }
 
+// SessionOverrideStarter is implemented by agents that support per-spawn
+// permission overrides beyond just the mode (guest skill whitelist): agents
+// generate Skill(skill:X) deny rules from the skills directory minus the
+// whitelist, so any skill not explicitly allowed is denied for that session.
+// guestAllowedSkills == nil means no restriction (admin sessions); mode == ""
+// keeps the configured mode. Agents that only need mode overrides can stick to
+// SessionModeStarter; agents implementing this interface take precedence.
+type SessionOverrideStarter interface {
+	StartSessionWithOverrides(ctx context.Context, sessionID string, mode string, guestAllowedSkills []string) (AgentSession, error)
+}
+
 // AllowFromManager is implemented by platforms whose allow_from admission list
 // can be updated at runtime (the /allowlist command). GetAllowFrom returns the
 // current comma-separated list; SetAllowFrom atomically replaces it and takes

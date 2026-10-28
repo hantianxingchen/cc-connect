@@ -407,6 +407,7 @@ type Engine struct {
 	disabledCmds map[string]bool
 	adminFrom    string           // comma-separated user IDs for privileged commands; "*" = all allowed users; "" = deny
 	adminMode    string           // per-spawn permission mode for admins' private sessions; "" = disabled, everyone uses project mode
+	guestAllowedSkills []string   // skill whitelist for non-admin/group sessions; empty = no restriction (see SetGuestAllowedSkills)
 	userRoles    *UserRoleManager // nil = legacy mode (no per-user policies)
 	userRolesMu  sync.RWMutex     // protects userRoles, disabledCmds, and adminFrom
 
@@ -1311,6 +1312,22 @@ func (e *Engine) SetAdminMode(mode string) {
 	e.userRolesMu.Unlock()
 }
 
+// SetGuestAllowedSkills sets the skill whitelist for non-admin sessions
+// (guest_allowed_skills config). Agents turn it into "everything not on the
+// list is denied" Skill rules at spawn, so newly added skills are denied by
+// default. Empty/nil disables the restriction entirely.
+func (e *Engine) SetGuestAllowedSkills(skills []string) {
+	trimmed := make([]string, 0, len(skills))
+	for _, s := range skills {
+		if s = strings.TrimSpace(s); s != "" {
+			trimmed = append(trimmed, s)
+		}
+	}
+	e.userRolesMu.Lock()
+	e.guestAllowedSkills = trimmed
+	e.userRolesMu.Unlock()
+}
+
 // privilegedCommands are commands that require admin_from authorization.
 var privilegedCommands = map[string]bool{
 	"shell":     true,
@@ -1413,15 +1430,50 @@ func (e *Engine) adminModeOverride(sessionKey, userID string) string {
 	return am
 }
 
-// startAgentSession spawn 会话：modeOverride 非空且 agent 实现了
-// SessionModeStarter 时注入专属权限档（admin_mode：admin 私聊会话免弹窗），
+// spawnOverrides 是 adminModeOverride 的扩展：同时返回该会话 spawn 时要
+// 注入的权限档与 guest skill 白名单。注入矩阵——
+//   admin 私聊：admin_mode 档（若配置），永不注入 guest 白名单（全量可用）
+//   非 admin 私聊：默认档 + guest 白名单（若配置，白名单外 skill 全禁）
+//   群聊共享会话：默认档 + guest 白名单（按最严——多人共享不能放开个人
+//     skill，即使 admin 在群内触发）
+// 两者都为空时完全回落原生 StartSession，语义与未开启特性一致。
+func (e *Engine) spawnOverrides(sessionKey, userID string) (mode string, guestAllowed []string) {
+	e.userRolesMu.RLock()
+	am := e.adminMode
+	gas := e.guestAllowedSkills
+	e.userRolesMu.RUnlock()
+	group := isGroupSessionKey(sessionKey)
+	if !group && e.isAdmin(userID) {
+		return am, nil
+	}
+	if len(gas) > 0 {
+		return "", gas
+	}
+	return "", nil
+}
+
+// startAgentSession spawn 会话：modeOverride / guestAllowed 非空且 agent
+// 实现了对应接口时注入（admin_mode：admin 私聊免弹窗；guest 白名单：非
+// admin 会话白名单外 skill 全禁）。SessionOverrideStarter 优先（能力超集），
 // 其余情况走原生 StartSession，行为与未开启该特性完全一致。
-func (e *Engine) startAgentSession(agent Agent, sessionID, modeOverride string) (AgentSession, error) {
-	if modeOverride != "" {
-		if starter, ok := agent.(SessionModeStarter); ok {
-			slog.Info("session spawned with admin_mode override",
-				"session_id", sessionID, "mode", modeOverride, "agent", agent.Name())
-			return starter.StartSessionWithMode(e.ctx, sessionID, modeOverride)
+func (e *Engine) startAgentSession(agent Agent, sessionID, modeOverride string, guestAllowed []string) (AgentSession, error) {
+	if modeOverride != "" || len(guestAllowed) > 0 {
+		if o, ok := agent.(SessionOverrideStarter); ok {
+			slog.Info("session spawned with overrides",
+				"session_id", sessionID, "mode", modeOverride,
+				"guest_skill_whitelist", len(guestAllowed), "agent", agent.Name())
+			return o.StartSessionWithOverrides(e.ctx, sessionID, modeOverride, guestAllowed)
+		}
+		if modeOverride != "" {
+			if starter, ok := agent.(SessionModeStarter); ok {
+				slog.Info("session spawned with admin_mode override",
+					"session_id", sessionID, "mode", modeOverride, "agent", agent.Name())
+				return starter.StartSessionWithMode(e.ctx, sessionID, modeOverride)
+			}
+		}
+		if len(guestAllowed) > 0 {
+			slog.Warn("agent does not implement SessionOverrideStarter; guest skill whitelist dropped",
+				"session_id", sessionID, "agent", agent.Name())
 		}
 	}
 	return agent.StartSession(e.ctx, sessionID)
@@ -4182,9 +4234,10 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	if agent != e.agent {
 		agentOverride = agent
 	}
-	// admin_mode：admin 私聊会话注入专属权限档（群聊/非 admin 返回空，回落默认）
-	modeOverride := e.adminModeOverride(interactiveKey, msg.UserID)
-	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, modeOverride)
+	// admin_mode + guest 白名单：admin 私聊注入专属权限档（不禁 skill）；
+	// 非 admin 私聊/群聊注入 guest skill 白名单（白名单外全禁）
+	modeOverride, guestAllowed := e.spawnOverrides(interactiveKey, msg.UserID)
+	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, modeOverride, guestAllowed)
 
 	// Set workspaceDir on the state for idle reaper identification
 	if workspaceDir != "" {
@@ -4469,7 +4522,9 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY env injection; otherwise sessionKey is used.
 // modeOverride, when non-empty, is injected as the spawn permission mode instead of
 // the agent's configured mode (admin_mode: admins' private sessions only).
-func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, modeOverride string) *interactiveState {
+// guestAllowed, when non-empty, restricts the spawned session to that skill
+// whitelist (everything else gets Skill deny rules; non-admin/group sessions).
+func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, modeOverride string, guestAllowed []string) *interactiveState {
 	// /stop removes the state from the map immediately but tears the process
 	// down in the background. Wait that teardown out *before* taking the lock:
 	// spawning now would start a second process on the same agent session ID
@@ -4608,7 +4663,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 
 	isResume := startSessionID != ""
 	startAt := time.Now()
-	agentSession, err := e.startAgentSession(agent, startSessionID, modeOverride)
+	agentSession, err := e.startAgentSession(agent, startSessionID, modeOverride, guestAllowed)
 	startElapsed := time.Since(startAt)
 	if err != nil {
 		// If resume/continue failed, try a fresh session as fallback.
@@ -4621,7 +4676,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 			session.SetAgentSessionID("", agent.Name())
 			sessions.Save()
 			startAt = time.Now()
-			agentSession, err = e.startAgentSession(agent, "", modeOverride)
+			agentSession, err = e.startAgentSession(agent, "", modeOverride, guestAllowed)
 			startElapsed = time.Since(startAt)
 			if err == nil {
 				slog.Info("fresh session started after resume failure",

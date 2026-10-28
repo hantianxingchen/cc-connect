@@ -546,6 +546,7 @@ func main() {
 		engine.SetAdminFrom(proj.AdminFrom)
 		// Wire admin permission mode (admins' private sessions)
 		engine.SetAdminMode(proj.AdminMode)
+		engine.SetGuestAllowedSkills(proj.GuestAllowedSkills)
 
 		// Wire per-user role-based policies
 		if proj.Users != nil {
@@ -1948,6 +1949,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	engine.SetAdminFrom(proj.AdminFrom)
 	// Reload admin permission mode
 	engine.SetAdminMode(proj.AdminMode)
+	engine.SetGuestAllowedSkills(proj.GuestAllowedSkills)
 
 	// Reload per-user role-based policies
 	if proj.Users != nil {

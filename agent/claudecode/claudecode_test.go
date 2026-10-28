@@ -1250,3 +1250,43 @@ func TestConfigHomeFromEnv_HonorsPerProjectConfigDir(t *testing.T) {
 		t.Errorf("configHomeFromEnv(nil) = %q, want %q", got, want)
 	}
 }
+
+// TestGuestSkillDenyRules 验证白名单 diff 语义：白名单外全禁（含软链形态
+// 的 skill 条目）、目录不可读宽松回落、白名单 trim 匹配。
+func TestGuestSkillDenyRules(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"db_query", "log_query", "zhixiao", "ziwei"} {
+		if err := os.MkdirAll(filepath.Join(dir, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 软链形态的 skill（bot 的 skills 目录条目可能是指向 skill 目录的链接）
+	link := filepath.Join(dir, "trend-stock-toolkit")
+	if err := os.Symlink(filepath.Join(dir, "db_query"), link); err != nil {
+		t.Fatal(err)
+	}
+
+	rules := guestSkillDenyRules(dir, []string{"db_query", " log_query "})
+	got := map[string]bool{}
+	for _, r := range rules {
+		got[r] = true
+	}
+	want := map[string]bool{
+		"Skill(skill:zhixiao)":            true,
+		"Skill(skill:ziwei)":              true,
+		"Skill(skill:trend-stock-toolkit)": true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("deny rules = %v, want exactly %v", rules, want)
+	}
+	for w := range want {
+		if !got[w] {
+			t.Fatalf("missing rule %q in %v", w, rules)
+		}
+	}
+
+	// 目录不可读：宽松回落 nil（不禁），避免把 guest 会话锁死
+	if rules := guestSkillDenyRules(filepath.Join(dir, "nope"), []string{"x"}); rules != nil {
+		t.Fatalf("unreadable dir should fall back to nil, got %v", rules)
+	}
+}
