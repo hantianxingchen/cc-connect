@@ -591,7 +591,8 @@ func guestSkillDenyRules(skillsDir string, allowed []string) []string {
 	var rules []string
 	for _, e := range entries {
 		name := e.Name()
-		if allowedSet[name] {
+		// 隐藏目录（.git 等）不是 skill，跳过（skills 目录就地 git 管理时存在）
+		if allowedSet[name] || strings.HasPrefix(name, ".") {
 			continue
 		}
 		info, err := e.Info()

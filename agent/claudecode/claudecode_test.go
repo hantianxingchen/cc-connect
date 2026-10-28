@@ -1255,7 +1255,7 @@ func TestConfigHomeFromEnv_HonorsPerProjectConfigDir(t *testing.T) {
 // 的 skill 条目）、目录不可读宽松回落、白名单 trim 匹配。
 func TestGuestSkillDenyRules(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{"db_query", "log_query", "zhixiao", "ziwei"} {
+	for _, name := range []string{"db_query", "log_query", "zhixiao", "ziwei", ".git"} {
 		if err := os.MkdirAll(filepath.Join(dir, name), 0o755); err != nil {
 			t.Fatal(err)
 		}
