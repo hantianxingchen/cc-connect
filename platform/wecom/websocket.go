@@ -52,6 +52,10 @@ type WSPlatform struct {
 	// allowFrom 运行时可变（/allowlist 命令热更新准入名单），allowMu 保护；
 	// 与 conn 写锁（mu）分离避免读写名单阻塞消息发送
 	allowMu sync.RWMutex
+	// 企微官方 MCP 端点凭证与地址（N1 未授权通知把混淆 chat_id 翻译成
+	// chat_name 用；mcpAPIKey 为空 = 翻译功能关闭，通知保持纯混淆 ID）
+	mcpAPIKey  string
+	mcpBaseURL string
 }
 
 const (
@@ -145,6 +149,8 @@ func newWebSocket(opts map[string]any) (core.Platform, error) {
 		wsURL = wsEndpoint
 	}
 	groupShared, _ := opts["group_shared_sessions"].(bool)
+	mcpAPIKey, _ := opts["mcp_apikey"].(string)
+	mcpBaseURL, _ := opts["mcp_url"].(string)
 
 	return &WSPlatform{
 		botID:               botID,
@@ -152,6 +158,8 @@ func newWebSocket(opts map[string]any) (core.Platform, error) {
 		allowFrom:           allowFrom,
 		wsURL:               wsURL,
 		groupSharedSessions: groupShared,
+		mcpAPIKey:           strings.TrimSpace(mcpAPIKey),
+		mcpBaseURL:          strings.TrimSpace(mcpBaseURL),
 	}, nil
 }
 
@@ -524,15 +532,19 @@ func (p *WSPlatform) handleMsgCallback(frame wsFrame) {
 // send the complete content in one frame with finish=true.
 // Markdown is natively supported by the stream reply format.
 // notifyUnauthorizedAdmins 把未授权访问事件 proactive Send 推送给 adminFrom
-// 名单里的管理员（私聊场景 admin 的 userID 即其 chatID）。管理员拿混淆 ID
-// 即可决定是否将该用户加入 allow_from。同一 adminID|userID 对 1 小时内至多
-// 一条通知，防止好奇用户连发刷屏。发送失败只记日志，不影响拦截主流程。
+// 名单里的管理员（私聊场景 admin 的 userID 即其 chatID）。通知里混淆 ID
+// 会先经企微 MCP sessions_list 翻译成 chat_name（拼音+真名），管理员可直接
+// 识别摸门者，混淆 ID 原样保留作为 /allowlist add 的凭证。同一 adminID|userID
+// 对 1 小时内至多一条通知，防止好奇用户连发刷屏。翻译与发送全程异步，
+// 失败只记日志，不影响拦截主流程。
 func (p *WSPlatform) notifyUnauthorizedAdmins(body *wsMsgCallbackBody) {
 	admins := strings.Split(p.adminFrom, ",")
 	if len(admins) == 0 {
 		return
 	}
 	now := time.Now()
+	// 先过去重收集本轮要通知的管理员，全被去重则不做任何翻译/发送
+	var targets []string
 	for _, admin := range admins {
 		admin = strings.TrimSpace(admin)
 		// "*" 全员 admin 时无具体通知目标；被拦者本人是 admin 不会发生（在 allow_from 内）
@@ -550,23 +562,32 @@ func (p *WSPlatform) notifyUnauthorizedAdmins(body *wsMsgCallbackBody) {
 		}
 		p.lastNotify[dedupKey] = now
 		p.notifyMu.Unlock()
+		targets = append(targets, admin)
+	}
+	if len(targets) == 0 {
+		return
+	}
 
-		source := "私聊"
-		if body.ChatType == "group" {
-			source = fmt.Sprintf("群聊（%s）", body.ChatID)
-		}
+	source := "私聊"
+	if body.ChatType == "group" {
+		source = fmt.Sprintf("群聊（%s）", body.ChatID)
+	}
+	// 异步翻译+发送：sessions_list 查询最坏 1.5s、Send 最坏等 ack 超时（5s/管理员），
+	// 都不该阻塞拦截主流程；翻译失败降级纯混淆 ID，通知照发。
+	// 私聊场景 chatID 回落到 userID（见 handleMsgCallback），
+	// 故直接用 admin userID 构造发送上下文
+	go func() {
+		chatName, ok := p.resolveUser(context.Background(), body.From.UserID)
+		who := userLabel(body.From.UserID, chatName, ok)
 		content := fmt.Sprintf("⚠️ 未授权访问\n用户：%s\n来源：%s\n时间：%s\n内容：「%s」",
-			body.From.UserID, source, now.Format("2006-01-02 15:04"),
+			who, source, now.Format("2006-01-02 15:04"),
 			truncRunes(body.Text.Content, 80))
-		// 异步发送：Send 最坏等 ack 超时（5s/管理员），不该阻塞拦截主流程；
-		// 私聊场景 chatID 回落到 userID（见 handleMsgCallback），
-		// 故直接用 admin userID 构造发送上下文
-		go func(admin, content string) {
+		for _, admin := range targets {
 			if err := p.Send(context.Background(), wsReplyContext{chatID: admin}, content); err != nil {
 				slog.Warn("wecom-ws: unauthorized access notify failed", "admin", admin, "error", err)
 			}
-		}(admin, content)
-	}
+		}
+	}()
 }
 
 // truncRunes 按 rune 截断字符串，超长补省略号（通知内容预览用）。
