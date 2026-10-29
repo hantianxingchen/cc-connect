@@ -33,7 +33,7 @@ func TestHandleControlRequestBypassModesStillEmitAskUserQuestion(t *testing.T) {
 			cs := &claudeSession{
 				events:  make(chan core.Event, 1),
 				ctx:     ctx,
-				ccHooks: newCCPermissionHookRunner(t.TempDir()),
+				ccHooks: newCCPermissionHookRunner(t.TempDir(), ""),
 			}
 			cs.setPermissionMode(tt.mode)
 			cs.handleControlRequest(map[string]any{

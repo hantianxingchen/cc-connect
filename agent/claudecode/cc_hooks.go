@@ -43,28 +43,35 @@ type ccHookDecision struct {
 // hookContext carries the session context needed to build hook stdin.
 // Fields mirror Claude Code's PermissionRequest hook input spec.
 type hookContext struct {
-	sessionID          string
-	toolName           string
-	toolInput          map[string]any
-	cwd                string
-	permissionMode     string
-	transcriptPath     string
-	permissionSuggestions []any // nil = omit from stdin
-	agentID            string // empty = omit
-	agentType          string // empty = omit
+	sessionID             string
+	toolName              string
+	toolInput             map[string]any
+	cwd                   string
+	permissionMode        string
+	transcriptPath        string
+	permissionSuggestions []any  // nil = omit from stdin
+	agentID               string // empty = omit
+	agentType             string // empty = omit
 }
 
 // ccPermissionHookRunner reads and executes Claude Code PermissionRequest
 // hooks. Settings are loaded once on first use and reused for the session.
 type ccPermissionHookRunner struct {
-	workDir  string
-	once     sync.Once
-	settings *ccSettings
+	workDir    string
+	configHome string
+	once       sync.Once
+	settings   *ccSettings
 }
 
-func newCCPermissionHookRunner(workDir string) *ccPermissionHookRunner {
+// newCCPermissionHookRunner 构造 hook runner。configHome 必须传会话自己的
+// CLAUDE_CONFIG_DIR（从 spawn env 解析），不能用 daemon 进程的 env——daemon
+// 由 launchd 启动没有该变量，会回落到 ~/.claude 读到主 CLI 的 settings hooks，
+// 导致 bot 会话执行主人的 PermissionRequest hook（2026-10-29 实测串台）。
+// 传空串保持旧回落行为（测试/CLI 场景）。
+func newCCPermissionHookRunner(workDir, configHome string) *ccPermissionHookRunner {
 	return &ccPermissionHookRunner{
-		workDir: workDir,
+		workDir:    workDir,
+		configHome: configHome,
 	}
 }
 
@@ -109,7 +116,7 @@ func (r *ccPermissionHookRunner) tryHook(
 func (r *ccPermissionHookRunner) loadSettings() *ccSettings {
 	merged := &ccSettings{}
 	found := false
-	for _, p := range settingsPaths(r.workDir) {
+	for _, p := range r.settingsPaths() {
 		s, err := readSettingsFile(p)
 		if err != nil {
 			if !os.IsNotExist(err) {
@@ -128,16 +135,21 @@ func (r *ccPermissionHookRunner) loadSettings() *ccSettings {
 }
 
 // settingsPaths returns the settings.json paths to read, in order.
-func settingsPaths(workDir string) []string {
-	configHome := claudeConfigHomeDir()
+// Uses the session's own config home (r.configHome) when set; falls back to
+// the process env resolution (claudeConfigHomeDir) for CLI/test callers.
+func (r *ccPermissionHookRunner) settingsPaths() []string {
+	configHome := r.configHome
+	if configHome == "" {
+		configHome = claudeConfigHomeDir()
+	}
 	paths := []string{
 		filepath.Join(configHome, "settings.json"),
 		filepath.Join(configHome, "settings.local.json"),
 	}
-	if workDir != "" {
+	if r.workDir != "" {
 		paths = append(paths,
-			filepath.Join(workDir, ".claude", "settings.json"),
-			filepath.Join(workDir, ".claude", "settings.local.json"),
+			filepath.Join(r.workDir, ".claude", "settings.json"),
+			filepath.Join(r.workDir, ".claude", "settings.local.json"),
 		)
 	}
 	return paths

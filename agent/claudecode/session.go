@@ -528,7 +528,7 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 		cancel:              cancel,
 		done:                make(chan struct{}),
 		gracefulStopTimeout: defaultGracefulStopTimeout,
-		ccHooks:             newCCPermissionHookRunner(workDir),
+		ccHooks:             newCCPermissionHookRunner(workDir, envValue(extraEnv, "CLAUDE_CONFIG_DIR")),
 		startupWarning:      rootDowngradeWarning,
 		promptFilePath:      cleanupPromptPath,
 		ctxWindowOverride:   ctxWindowTokens,

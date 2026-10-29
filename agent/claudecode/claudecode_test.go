@@ -1272,8 +1272,8 @@ func TestGuestSkillDenyRules(t *testing.T) {
 		got[r] = true
 	}
 	want := map[string]bool{
-		"Skill(skill:zhixiao)":            true,
-		"Skill(skill:ziwei)":              true,
+		"Skill(skill:zhixiao)":             true,
+		"Skill(skill:ziwei)":               true,
 		"Skill(skill:trend-stock-toolkit)": true,
 	}
 	if len(got) != len(want) {
@@ -1288,5 +1288,39 @@ func TestGuestSkillDenyRules(t *testing.T) {
 	// 目录不可读：宽松回落 nil（不禁），避免把 guest 会话锁死
 	if rules := guestSkillDenyRules(filepath.Join(dir, "nope"), []string{"x"}); rules != nil {
 		t.Fatalf("unreadable dir should fall back to nil, got %v", rules)
+	}
+}
+
+// TestGuestDenyRules 验证 guest deny 规则集 = Skill 级 deny + 整目录 Read deny：
+// Read 规则封"Read 说明书 + Bash 跑脚本"的绕过路径，且独立于目录枚举——
+// 目录不可读时 Skill deny 宽松回落但 Read deny 仍生效（2026-10-29 穿透后加）。
+func TestGuestDenyRules(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "zhixiao"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rules := guestDenyRules(dir, []string{})
+	wantRead := "Read(" + ruleAbsPath(dir) + "/**)"
+	got := map[string]bool{}
+	for _, r := range rules {
+		got[r] = true
+	}
+	if !got["Skill(skill:zhixiao)"] {
+		t.Fatalf("missing skill deny rule in %v", rules)
+	}
+	if !got[wantRead] {
+		t.Fatalf("missing read deny rule %q in %v", wantRead, rules)
+	}
+
+	// 目录不可读：Read deny 仍生效（路径已知即可拦）
+	rules = guestDenyRules(filepath.Join(dir, "nope"), []string{})
+	if len(rules) != 1 || rules[0] != "Read("+ruleAbsPath(filepath.Join(dir, "nope"))+"/**)" {
+		t.Fatalf("unreadable dir should still return read deny, got %v", rules)
+	}
+
+	// 绝对路径规则用 // 双斜杠锚定（官方 deny 规则绝对路径写法）
+	if ruleAbsPath("/Users/x/skills") != "//Users/x/skills" {
+		t.Fatalf("ruleAbsPath double-slash = %q", ruleAbsPath("/Users/x/skills"))
 	}
 }

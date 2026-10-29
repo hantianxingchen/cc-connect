@@ -35,25 +35,25 @@ func init() {
 //   - "auto":              Claude's automatic permission classifier
 //   - "bypassPermissions": auto-approve everything (alias: yolo)
 type Agent struct {
-	workDir          string
-	cmd              string   // CLI binary name (default: "claude")
-	cliExtraArgs     []string // extra args parsed from cmd (e.g. ["code", "-t", "foo"])
-	configEnv        []string // env vars from [projects.agent.options.env] — persists across SetSessionEnv calls
-	cmdArgsFlag      string   // if set, claude args are passed as a single string via this flag (e.g. "-a")
-	model            string
-	reasoningEffort  string // "low" | "medium" | "high" | "max"
-	mode             string // "default" | "acceptEdits" | "plan" | "auto" | "bypassPermissions" | "dontAsk"
-	allowedTools     []string
-	disallowedTools  []string
+	workDir             string
+	cmd                 string   // CLI binary name (default: "claude")
+	cliExtraArgs        []string // extra args parsed from cmd (e.g. ["code", "-t", "foo"])
+	configEnv           []string // env vars from [projects.agent.options.env] — persists across SetSessionEnv calls
+	cmdArgsFlag         string   // if set, claude args are passed as a single string via this flag (e.g. "-a")
+	model               string
+	reasoningEffort     string // "low" | "medium" | "high" | "max"
+	mode                string // "default" | "acceptEdits" | "plan" | "auto" | "bypassPermissions" | "dontAsk"
+	allowedTools        []string
+	disallowedTools     []string
 	maxContextTokens    int // optional: passed as --max-context-tokens when > 0
 	contextWindowTokens int // optional: override the context-window-size heuristic used by the ctx% indicator. When <= 0, fall back to model-name heuristics.
 	providers           []core.ProviderConfig
-	activeIdx        int // -1 = no provider set
-	sessionEnv       []string
-	routerURL        string   // Claude Code Router URL (e.g., "http://127.0.0.1:3456")
-	routerAPIKey     string   // Claude Code Router API key (optional)
-	systemPrompt     string   // Custom system prompt to pass to Claude CLI
-	pluginDirs       []string // Plugin directories to load via --plugin-dir (repeatable)
+	activeIdx           int // -1 = no provider set
+	sessionEnv          []string
+	routerURL           string   // Claude Code Router URL (e.g., "http://127.0.0.1:3456")
+	routerAPIKey        string   // Claude Code Router API key (optional)
+	systemPrompt        string   // Custom system prompt to pass to Claude CLI
+	pluginDirs          []string // Plugin directories to load via --plugin-dir (repeatable)
 
 	appendSystemPrompt string // Custom text appended to the system prompt (keeps Claude's default)
 
@@ -547,30 +547,54 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 // sessions). Empty mode uses a.mode; non-empty values go through
 // normalizePermissionMode, so user-friendly aliases (e.g. "yolo") are accepted.
 func (a *Agent) StartSessionWithMode(ctx context.Context, sessionID string, modeOverride string) (core.AgentSession, error) {
-	return a.startSessionLocked(ctx, sessionID, modeOverride, nil)
+	return a.startSessionLocked(ctx, sessionID, modeOverride, nil, nil)
 }
 
 // StartSessionWithOverrides 扩展 mode 注入：同时支持 guest skill 白名单
 // （engine 的 guest_allowed_skills，非 admin/群聊会话）。白名单非空时读
 // skills 目录（CLAUDE_CONFIG_DIR/skills，bot 实例独立 home）diff 出白名单外
-// 的 skill 生成 Skill(skill:X) deny 规则，追加到 disallowedTools 注入 spawn。
-// 白名单为空 = 无限制（admin 会话全量可用）。目录读不到时宽松回落（只记
-// 日志不禁），避免目录异常把 guest 会话锁死。
+// 的 skill 生成 Skill(skill:X) deny 规则，追加到 disallowedTools 注入 spawn；
+// 同时注入 CC_CONNECT_GUEST=1 环境标记（guest 闸：skill 脚本可自检拒绝，
+// 封 Bash 直接跑脚本的绕过）。白名单为空 = 无限制（admin 会话全量可用）。
+// 目录读不到时宽松回落（只记日志不禁 Skill），避免目录异常把 guest 会话
+// 锁死；Read deny 独立于目录枚举仍生效。
 func (a *Agent) StartSessionWithOverrides(ctx context.Context, sessionID string, modeOverride string, guestAllowedSkills []string) (core.AgentSession, error) {
 	if len(guestAllowedSkills) == 0 {
-		return a.startSessionLocked(ctx, sessionID, modeOverride, nil)
+		return a.startSessionLocked(ctx, sessionID, modeOverride, nil, nil)
 	}
 	a.mu.Lock()
 	env := a.runtimeEnvLocked()
 	a.mu.Unlock()
 	var deny []string
 	if configDir := envValue(env, "CLAUDE_CONFIG_DIR"); configDir != "" {
-		deny = guestSkillDenyRules(filepath.Join(configDir, "skills"), guestAllowedSkills)
+		deny = guestDenyRules(filepath.Join(configDir, "skills"), guestAllowedSkills)
 	} else {
 		slog.Warn("claudecode: CLAUDE_CONFIG_DIR not set; guest skill whitelist skipped",
 			"session_id", sessionID)
 	}
-	return a.startSessionLocked(ctx, sessionID, modeOverride, deny)
+	// guest 环境标记：CC 会话进程 env 会传给其 Bash 子进程，skill 脚本
+	// （如 zhixiao 的 zx.cjs）自检此标记即拒绝执行——命令变体绕不过脚本自身
+	guestEnv := []string{"CC_CONNECT_GUEST=1"}
+	return a.startSessionLocked(ctx, sessionID, modeOverride, deny, guestEnv)
+}
+
+// guestDenyRules = Skill 级 deny（目录枚举）+ 整目录 Read deny。
+// skill 本质是磁盘文件（SKILL.md 说明书 + 可执行脚本），只 deny Skill 工具
+// 挡不住"Read 说明书拿命令 + Bash 直接跑脚本"的绕过（2026-10-29 实测穿透），
+// Read deny 封住发现路径；Bash 变体跑脚本由 CC_CONNECT_GUEST 闸兜底。
+// Read 规则独立于目录枚举：目录读不到时 Skill deny 宽松回落，Read deny 仍生效。
+func guestDenyRules(skillsDir string, allowed []string) []string {
+	rules := guestSkillDenyRules(skillsDir, allowed)
+	return append(rules, "Read("+ruleAbsPath(skillsDir)+"/**)")
+}
+
+// ruleAbsPath 把绝对路径转成 CC 权限规则的路径形态：/ 开头补成 // 双斜杠
+// 锚定（官方 deny 规则绝对路径写法，见 permissions 文档）。
+func ruleAbsPath(p string) string {
+	if strings.HasPrefix(p, "/") {
+		return "/" + p
+	}
+	return p
 }
 
 // guestSkillDenyRules 由 skills 目录与白名单 diff 出禁用的 skill，生成
@@ -619,8 +643,9 @@ func envValue(env []string, key string) string {
 }
 
 // startSessionLocked 是 StartSessionWithMode/WithOverrides 的共同主体：
-// extraDeny 非空时追加到 agent 级 disallowedTools 一起注入 spawn。
-func (a *Agent) startSessionLocked(ctx context.Context, sessionID string, modeOverride string, extraDeny []string) (core.AgentSession, error) {
+// extraDeny 非空时追加到 agent 级 disallowedTools 一起注入 spawn；
+// sessionEnv 非空时追加到 spawn 环境变量（guest 闸标记等）。
+func (a *Agent) startSessionLocked(ctx context.Context, sessionID string, modeOverride string, extraDeny []string, sessionEnv []string) (core.AgentSession, error) {
 	a.mu.Lock()
 	tools := make([]string, len(a.allowedTools))
 	copy(tools, a.allowedTools)
@@ -640,7 +665,7 @@ func (a *Agent) startSessionLocked(ctx context.Context, sessionID string, modeOv
 	}
 	pluginDirs := make([]string, len(a.pluginDirs))
 	copy(pluginDirs, a.pluginDirs)
-	extraEnv := a.runtimeEnvLocked()
+	extraEnv := append(a.runtimeEnvLocked(), sessionEnv...)
 
 	activeIdx := a.activeIdx
 	var activeProviderName string

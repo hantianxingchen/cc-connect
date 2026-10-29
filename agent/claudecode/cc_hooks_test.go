@@ -134,12 +134,12 @@ func TestReadSettingsFile(t *testing.T) {
 
 func TestParseHookOutput(t *testing.T) {
 	tests := []struct {
-		name         string
-		stdout       string
-		wantBehavior string
-		wantMessage  string
+		name            string
+		stdout          string
+		wantBehavior    string
+		wantMessage     string
 		wantFallthrough bool
-		wantErr      bool
+		wantErr         bool
 	}{
 		{"allow", "allow", "allow", "", false, false},
 		{"deny", "deny", "deny", "", false, false},
@@ -247,7 +247,7 @@ func TestTryHook(t *testing.T) {
 			}
 		}`), 0644)
 
-		r := newCCPermissionHookRunner(dir)
+		r := newCCPermissionHookRunner(dir, "")
 		hctx := hookContext{sessionID: "test-session", toolName: "Bash", toolInput: map[string]any{"command": "ls"}, cwd: dir}
 		decision, ok := r.tryHook(context.Background(), hctx)
 		if !ok {
@@ -271,7 +271,7 @@ func TestTryHook(t *testing.T) {
 			}
 		}`), 0644)
 
-		r := newCCPermissionHookRunner(dir)
+		r := newCCPermissionHookRunner(dir, "")
 		hctx := hookContext{sessionID: "test-session", toolName: "Bash", toolInput: map[string]any{"command": "ls"}, cwd: dir}
 		_, ok := r.tryHook(context.Background(), hctx)
 		if ok {
@@ -292,7 +292,7 @@ func TestTryHook(t *testing.T) {
 			}
 		}`), 0644)
 
-		r := newCCPermissionHookRunner(dir)
+		r := newCCPermissionHookRunner(dir, "")
 		hctx := hookContext{sessionID: "test-session", toolName: "Bash", toolInput: map[string]any{}, cwd: dir}
 		_, ok := r.tryHook(context.Background(), hctx)
 		if ok {
@@ -313,7 +313,7 @@ func TestTryHook(t *testing.T) {
 			}
 		}`), 0644)
 
-		r := newCCPermissionHookRunner(dir)
+		r := newCCPermissionHookRunner(dir, "")
 		hctx := hookContext{sessionID: "test-session", toolName: "AnyTool", toolInput: map[string]any{}, cwd: dir}
 		decision, ok := r.tryHook(context.Background(), hctx)
 		if !ok {
@@ -325,11 +325,39 @@ func TestTryHook(t *testing.T) {
 	})
 
 	t.Run("no settings files", func(t *testing.T) {
-		r := newCCPermissionHookRunner("/nonexistent/path")
+		r := newCCPermissionHookRunner("/nonexistent/path", "")
 		hctx := hookContext{sessionID: "test-session", toolName: "Bash", toolInput: map[string]any{}}
 		_, ok := r.tryHook(context.Background(), hctx)
 		if ok {
 			t.Fatal("expected no match when no settings exist")
+		}
+	})
+
+	// configHome 必须用会话自己的 CLAUDE_CONFIG_DIR：daemon 进程无该 env 时
+	// 回落 ~/.claude 会读到主 CLI 的 hooks（2026-10-29 实测串台），此 case
+	// 固定"configHome 指定目录的 hooks 生效、与 workDir 无关"的语义。
+	t.Run("configHome overrides env fallback", func(t *testing.T) {
+		dir := t.TempDir()
+		homeDir := filepath.Join(dir, "bot-home")
+		_ = os.MkdirAll(homeDir, 0o755)
+		_ = os.WriteFile(filepath.Join(homeDir, "settings.json"), []byte(`{
+			"hooks": {
+				"PermissionRequest": [{
+					"matcher": "Bash",
+					"hooks": [{"type": "command", "command": "echo deny"}]
+				}]
+			}
+		}`), 0o644)
+
+		// workDir 指向另一目录（无 hooks）；configHome 生效则 Bash 被 deny
+		r := newCCPermissionHookRunner(filepath.Join(dir, "work"), homeDir)
+		hctx := hookContext{sessionID: "s", toolName: "Bash", toolInput: map[string]any{"command": "ls"}}
+		decision, ok := r.tryHook(context.Background(), hctx)
+		if !ok {
+			t.Fatal("expected hook from configHome settings to match")
+		}
+		if decision.Behavior != "deny" {
+			t.Errorf("behavior = %q, want deny (from configHome settings)", decision.Behavior)
 		}
 	})
 
@@ -346,7 +374,7 @@ func TestTryHook(t *testing.T) {
 			}
 		}`), 0644)
 
-		r := newCCPermissionHookRunner(dir)
+		r := newCCPermissionHookRunner(dir, "")
 		hctx := hookContext{sessionID: "test-session", toolName: "Bash", toolInput: map[string]any{}, cwd: dir}
 		decision, ok := r.tryHook(context.Background(), hctx)
 		if !ok {
@@ -379,7 +407,7 @@ func TestTryHook(t *testing.T) {
 			}
 		}`), 0644)
 
-		r := newCCPermissionHookRunner(dir)
+		r := newCCPermissionHookRunner(dir, "")
 		hctx := hookContext{sessionID: "test-session", toolName: "Bash", toolInput: map[string]any{}, cwd: dir}
 		decision, ok := r.tryHook(context.Background(), hctx)
 		if !ok {
@@ -393,12 +421,12 @@ func TestTryHook(t *testing.T) {
 
 func TestBuildHookStdin(t *testing.T) {
 	hctx := hookContext{
-		sessionID:          "sess-123",
-		toolName:           "Bash",
-		toolInput:          map[string]any{"command": "ls"},
-		cwd:                "/workdir",
-		permissionMode:     "default",
-		transcriptPath:     "/tmp/transcript.jsonl",
+		sessionID:             "sess-123",
+		toolName:              "Bash",
+		toolInput:             map[string]any{"command": "ls"},
+		cwd:                   "/workdir",
+		permissionMode:        "default",
+		transcriptPath:        "/tmp/transcript.jsonl",
 		permissionSuggestions: []any{},
 	}
 	data := buildHookStdin(hctx)
