@@ -17157,6 +17157,8 @@ func TestAllowlistIntentFromText(t *testing.T) {
 		name, in, want string
 	}{
 		{"加白+ID", "把 wohR_KCgAAabcd1234 加到白名单", "/allowlist add wohR_KCgAAabcd1234"},
+		{"中文粘连ID", "把wohR_KCgAAabcd1234加白名单", "/allowlist add wohR_KCgAAabcd1234"},
+		{"中文标点粘连", "加白名单：wohR_KCgAAabcd1234，谢谢", "/allowlist add wohR_KCgAAabcd1234"},
 		{"英文关键词", "allowlist add o9cq80wR7E4vcjrI77G6MxMBOim4@im.wechat", "/allowlist add o9cq80wR7E4vcjrI77G6MxMBOim4@im.wechat"},
 		{"无ID不触发", "看一下白名单里都有谁", ""},
 		{"移除动词不触发", "把 wohR_KCgAAabcd1234 从白名单移除", ""},

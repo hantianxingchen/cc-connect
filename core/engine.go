@@ -16519,33 +16519,23 @@ func allowlistIntentFromText(content string) string {
 			return ""
 		}
 	}
-	fields := strings.Fields(content)
-	for _, f := range fields {
+	// 正则全文扫描而非空白分词：中文输入没有空格分隔习惯，ID 常与中文
+	// 粘连（"把wohR_xxx加白名单"），Fields 会把整句当一个 token 判非 ID。
+	// 中文字符不在字符类内，正则抽取天然在中文边界截断，粘连/带中文标点
+	// 均可命中（2026-10-29 真机踩坑：粘连消息未触发，落进 agent）。
+	for _, f := range allowlistIDTokenRe.FindAllString(content, -1) {
 		// 跳过关键词/子命令自身（"allowlist add xxx" 里 allowlist 也是
 		// 合法的 ID 形态 token，会抢先命中）
 		if strings.EqualFold(f, "allowlist") || strings.EqualFold(f, "add") {
 			continue
 		}
-		if len(f) >= 8 && isIDLikeToken(f) {
-			return "/allowlist add " + f
-		}
+		return "/allowlist add " + f
 	}
 	return ""
 }
 
-// isIDLikeToken 报告 token 是否像平台用户 ID（仅 ASCII 字母数字与 _ @ . -，
-// 长度 >= 8 已由调用方保证）
-func isIDLikeToken(s string) bool {
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-		case r == '_' || r == '@' || r == '.' || r == '-':
-		default:
-			return false
-		}
-	}
-	return true
-}
+// allowlistIDTokenRe 匹配 ID 形态子串：仅 ASCII 字母数字与 _ @ . -，长度 >= 8
+var allowlistIDTokenRe = regexp.MustCompile(`[A-Za-z0-9_@.\-]{8,}`)
 
 // ApplyPlatformAllowFrom 按平台类型热应用 allow_from（reloadConfig 补缺口：
 // 名单此前只在 daemon 启动时定格，/config reload 与 management reload 均不刷新）
