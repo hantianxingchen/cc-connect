@@ -551,16 +551,18 @@ func (a *Agent) StartSessionWithMode(ctx context.Context, sessionID string, mode
 }
 
 // StartSessionWithOverrides 扩展 mode 注入：同时支持 guest skill 白名单
-// （engine 的 guest_allowed_skills，非 admin/群聊会话）。白名单非空时读
-// skills 目录（CLAUDE_CONFIG_DIR/skills，bot 实例独立 home）diff 出白名单外
-// 的 skill 生成 Skill(skill:X) deny 规则，追加到 disallowedTools 注入 spawn；
-// 同时注入 CC_CONNECT_GUEST=1 环境标记（guest 闸：skill 脚本可自检拒绝，
-// 封 Bash 直接跑脚本的绕过）。白名单为空 = 无限制（admin 会话全量可用）。
+// （engine 的 guest_allowed_skills，非 admin/群聊会话）与会话级 env（engine
+// 的 ov_sessions 记忆插件分控等）。白名单非空时读 skills 目录
+// （CLAUDE_CONFIG_DIR/skills，bot 实例独立 home）diff 出白名单外的 skill
+// 生成 Skill(skill:X) deny 规则，追加到 disallowedTools 注入 spawn；同时注入
+// CC_CONNECT_GUEST=1 环境标记（guest 闸：skill 脚本可自检拒绝，封 Bash 直接
+// 跑脚本的绕过）。白名单为空 = 无限制（admin 会话全量可用），但 sessionEnv
+// 仍透传（admin 私聊的记忆插件开启注入走此路径）。
 // 目录读不到时宽松回落（只记日志不禁 Skill），避免目录异常把 guest 会话
 // 锁死；Read deny 独立于目录枚举仍生效。
-func (a *Agent) StartSessionWithOverrides(ctx context.Context, sessionID string, modeOverride string, guestAllowedSkills []string) (core.AgentSession, error) {
+func (a *Agent) StartSessionWithOverrides(ctx context.Context, sessionID string, modeOverride string, guestAllowedSkills []string, sessionEnv []string) (core.AgentSession, error) {
 	if len(guestAllowedSkills) == 0 {
-		return a.startSessionLocked(ctx, sessionID, modeOverride, nil, nil)
+		return a.startSessionLocked(ctx, sessionID, modeOverride, nil, sessionEnv)
 	}
 	a.mu.Lock()
 	env := a.runtimeEnvLocked()
@@ -574,18 +576,29 @@ func (a *Agent) StartSessionWithOverrides(ctx context.Context, sessionID string,
 	}
 	// guest 环境标记：CC 会话进程 env 会传给其 Bash 子进程，skill 脚本
 	// （如 zhixiao 的 zx.cjs）自检此标记即拒绝执行——命令变体绕不过脚本自身
-	guestEnv := []string{"CC_CONNECT_GUEST=1"}
+	guestEnv := append([]string{"CC_CONNECT_GUEST=1"}, sessionEnv...)
 	return a.startSessionLocked(ctx, sessionID, modeOverride, deny, guestEnv)
 }
 
-// guestDenyRules = Skill 级 deny（目录枚举）+ 整目录 Read deny。
-// skill 本质是磁盘文件（SKILL.md 说明书 + 可执行脚本），只 deny Skill 工具
-// 挡不住"Read 说明书拿命令 + Bash 直接跑脚本"的绕过（2026-10-29 实测穿透），
-// Read deny 封住发现路径；Bash 变体跑脚本由 CC_CONNECT_GUEST 闸兜底。
+// guestDenyRules = Skill 级 deny（目录枚举）+ 整目录 Read deny + OV 数据目录
+// Read deny + OV plugin MCP 工具 deny。skill 本质是磁盘文件（SKILL.md 说明书 +
+// 可执行脚本），只 deny Skill 工具挡不住"Read 说明书拿命令 + Bash 直接跑脚本"
+// 的绕过（2026-10-29 实测穿透），Read deny 封住发现路径；Bash 变体跑脚本由
+// CC_CONNECT_GUEST 闸兜底。~/.openviking 内含 OV 服务器连接凭证（ovcli.conf
+// 的 key）与全库数据，guest 读到即可用 Bash 直连本地 OV API 绕过会话层一切
+// 防线——发现路径同样必须封。OV plugin 的 MCP server 由 CC 进程随 plugin
+// 自动拉起，不受 OPENVIKING_MEMORY_ENABLED 控制（那个 env 只 gate hooks），
+// guest 可经 mcp 工具直查/直写全库——工具面也必须 deny（弹窗自批自挡不住
+// deny-first）。hook 与 MCP server 是独立进程，不受 CC deny 影响，admin 侧零损。
 // Read 规则独立于目录枚举：目录读不到时 Skill deny 宽松回落，Read deny 仍生效。
 func guestDenyRules(skillsDir string, allowed []string) []string {
 	rules := guestSkillDenyRules(skillsDir, allowed)
-	return append(rules, "Read("+ruleAbsPath(skillsDir)+"/**)")
+	rules = append(rules, "Read("+ruleAbsPath(skillsDir)+"/**)")
+	if home, err := os.UserHomeDir(); err == nil {
+		rules = append(rules, "Read("+ruleAbsPath(filepath.Join(home, ".openviking"))+"/**)")
+	}
+	rules = append(rules, "mcp__plugin_openviking-memory_openviking__*")
+	return rules
 }
 
 // ruleAbsPath 把绝对路径转成 CC 权限规则的路径形态：/ 开头补成 // 双斜杠
@@ -595,6 +608,48 @@ func ruleAbsPath(p string) string {
 		return "/" + p
 	}
 	return p
+}
+
+// appendOvDefault 在 env 无显式 OPENVIKING_MEMORY_ENABLED 时补 fail-safe
+// 默认值 0（记忆插件关闭）。显式值（agent 配置 env 或会话级注入）不被
+// 默认覆盖——只补缺，不抢已有决策。
+func appendOvDefault(env []string) []string {
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "OPENVIKING_MEMORY_ENABLED=") {
+			return env
+		}
+	}
+	return append(env, "OPENVIKING_MEMORY_ENABLED=0")
+}
+
+// appendEnvUnique 把 additions 追加到 base，同名变量以 additions（后者）
+// 为准并去除重复项——子进程 env 列表同名条目的取舍取决于解析器实现，
+// 主动去重避免歧义。
+func appendEnvUnique(base []string, additions ...string) []string {
+	out := make([]string, 0, len(base)+len(additions))
+	out = append(out, base...)
+	for _, kv := range additions {
+		name := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			name = kv[:i]
+		}
+		replaced := false
+		for j, existing := range out {
+			exName := existing
+			if i := strings.IndexByte(existing, '='); i >= 0 {
+				exName = existing[:i]
+			}
+			if exName == name {
+				out[j] = kv
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 // guestSkillDenyRules 由 skills 目录与白名单 diff 出禁用的 skill，生成
@@ -644,7 +699,7 @@ func envValue(env []string, key string) string {
 
 // startSessionLocked 是 StartSessionWithMode/WithOverrides 的共同主体：
 // extraDeny 非空时追加到 agent 级 disallowedTools 一起注入 spawn；
-// sessionEnv 非空时追加到 spawn 环境变量（guest 闸标记等）。
+// sessionEnv 非空时追加到 spawn 环境变量（guest 闸标记、记忆插件分控等）。
 func (a *Agent) startSessionLocked(ctx context.Context, sessionID string, modeOverride string, extraDeny []string, sessionEnv []string) (core.AgentSession, error) {
 	a.mu.Lock()
 	tools := make([]string, len(a.allowedTools))
@@ -665,7 +720,12 @@ func (a *Agent) startSessionLocked(ctx context.Context, sessionID string, modeOv
 	}
 	pluginDirs := make([]string, len(a.pluginDirs))
 	copy(pluginDirs, a.pluginDirs)
-	extraEnv := append(a.runtimeEnvLocked(), sessionEnv...)
+	// 记忆插件 fail-safe 默认：cc-connect 拉起的一切 CC 会话（含 relay/cron
+	// 派生等无身份判定的路径）默认关闭记忆插件；engine 按身份决策注入的
+	// 会话级 OPENVIKING_MEMORY_ENABLED=1（sessionEnv，排在后面同名覆盖）或
+	// agent 配置 env 里的显式值优先。漏判的后果是"无记忆"而非"记忆泄漏"。
+	baseEnv := appendOvDefault(a.runtimeEnvLocked())
+	extraEnv := appendEnvUnique(baseEnv, sessionEnv...)
 
 	activeIdx := a.activeIdx
 	var activeProviderName string

@@ -538,6 +538,7 @@ type ProjectConfig struct {
 	AdminFrom        string       `toml:"admin_from,omitempty"`        // comma-separated user IDs allowed to run privileged commands; "*" = all allowed users
 	AdminMode        string       `toml:"admin_mode,omitempty"`        // permission mode injected for admin users' private sessions (e.g. "bypassPermissions"); empty = same mode as everyone
 	GuestAllowedSkills []string   `toml:"guest_allowed_skills,omitempty"` // skill whitelist for non-admin/group sessions; skills not on the list are denied at spawn (new skills denied by default); empty = no restriction
+	OvSessions         string     `toml:"ov_sessions,omitempty"`          // memory-plugin scoping: "admin" = memory on for admin private sessions only (everyone else explicitly off), "all" = on for every session; empty = no session-level decision, agent-level fail-safe default applies (memory plugin off unless the agent config env says otherwise)
 	Users            *UsersConfig `toml:"users,omitempty"`             // per-user role config; nil = legacy behavior
 	// WorkspaceIdleTimeoutMinsLegacy is the deprecated per-project form of
 	// the workspace idle reaper timeout. New configs should set the top-level

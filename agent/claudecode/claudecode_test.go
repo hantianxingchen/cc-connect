@@ -1313,14 +1313,62 @@ func TestGuestDenyRules(t *testing.T) {
 		t.Fatalf("missing read deny rule %q in %v", wantRead, rules)
 	}
 
-	// 目录不可读：Read deny 仍生效（路径已知即可拦）
+	// 目录不可读：skills Read deny 仍生效（路径已知即可拦）；OV 目录 deny 恒在
+	t.Setenv("HOME", dir)
 	rules = guestDenyRules(filepath.Join(dir, "nope"), []string{})
-	if len(rules) != 1 || rules[0] != "Read("+ruleAbsPath(filepath.Join(dir, "nope"))+"/**)" {
-		t.Fatalf("unreadable dir should still return read deny, got %v", rules)
+	wantOv := "Read(" + ruleAbsPath(filepath.Join(dir, ".openviking")) + "/**)"
+	if len(rules) != 3 || rules[0] != "Read("+ruleAbsPath(filepath.Join(dir, "nope"))+"/**)" || rules[1] != wantOv {
+		t.Fatalf("unreadable dir should still return read+ov deny, got %v", rules)
+	}
+	if !contains(rules, "mcp__plugin_openviking-memory_openviking__*") {
+		t.Fatalf("ov plugin mcp tools must be denied for guests, got %v", rules)
 	}
 
 	// 绝对路径规则用 // 双斜杠锚定（官方 deny 规则绝对路径写法）
 	if ruleAbsPath("/Users/x/skills") != "//Users/x/skills" {
 		t.Fatalf("ruleAbsPath double-slash = %q", ruleAbsPath("/Users/x/skills"))
 	}
+}
+
+// TestAppendOvDefault 验证记忆插件 fail-safe 默认：无显式值补 0，显式值
+// （配置或会话注入）不被默认覆盖。
+func TestAppendOvDefault(t *testing.T) {
+	if got := appendOvDefault([]string{"A=1"}); len(got) != 2 || got[1] != "OPENVIKING_MEMORY_ENABLED=0" {
+		t.Fatalf("default should be appended, got %v", got)
+	}
+	if got := appendOvDefault([]string{"OPENVIKING_MEMORY_ENABLED=1"}); len(got) != 1 {
+		t.Fatalf("explicit value must not be duplicated/overridden, got %v", got)
+	}
+	if got := appendOvDefault([]string{"OPENVIKING_MEMORY_ENABLED=0", "A=1"}); len(got) != 2 {
+		t.Fatalf("explicit off stays, got %v", got)
+	}
+}
+
+// TestAppendEnvUnique 验证会话级 env 同名覆盖语义：additions 后者胜、无
+// 同名则追加，产物无重复条目。
+func TestAppendEnvUnique(t *testing.T) {
+	base := []string{"A=1", "B=2"}
+	got := appendEnvUnique(base, "B=3", "C=4")
+	want := []string{"A=1", "B=3", "C=4"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v want %v", got, want)
+		}
+	}
+	// base 不被原地修改
+	if base[1] != "B=2" {
+		t.Fatalf("base mutated: %v", base)
+	}
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }

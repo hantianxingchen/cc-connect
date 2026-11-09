@@ -547,6 +547,8 @@ func main() {
 		// Wire admin permission mode (admins' private sessions)
 		engine.SetAdminMode(proj.AdminMode)
 		engine.SetGuestAllowedSkills(proj.GuestAllowedSkills)
+		// Wire memory-plugin scoping (ov_sessions)
+		engine.SetOvSessions(proj.OvSessions)
 
 		// Wire per-user role-based policies
 		if proj.Users != nil {
@@ -1950,6 +1952,8 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	// Reload admin permission mode
 	engine.SetAdminMode(proj.AdminMode)
 	engine.SetGuestAllowedSkills(proj.GuestAllowedSkills)
+	// Reload memory-plugin scoping
+	engine.SetOvSessions(proj.OvSessions)
 
 	// Reload per-user role-based policies
 	if proj.Users != nil {
