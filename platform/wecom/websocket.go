@@ -42,6 +42,11 @@ type WSPlatform struct {
 	// 群共享会话：群内所有人 @ bot 进同一个会话（sessionKey 去 userID 段），
 	// 上下文互通；默认 false 保持每用户独立会话的旧行为
 	groupSharedSessions bool
+	// 企微卡片通道开关（enable_wecom_card）。上游 #1645 的按钮回调只翻译权限卡片
+	// （perm:），菜单类按钮（nav:/act:）的点击会把原始动作串当用户消息喂给 agent。
+	// 默认 false：engine 经 core.CardSwitcher 把本平台当纯文本，行为与引入卡片前
+	// 一致；待上游补全按钮回调并真机验证后再显式开启。
+	cardsEnabled bool
 	// adminFrom 由 engine 注入（SetAdminFrom，core.AdminFromReceiver），
 	// 未授权用户被 allowFrom 拦截时 proactive Send 通知这些管理员
 	adminFrom string
@@ -149,6 +154,7 @@ func newWebSocket(opts map[string]any) (core.Platform, error) {
 		wsURL = wsEndpoint
 	}
 	groupShared, _ := opts["group_shared_sessions"].(bool)
+	cardsEnabled, _ := opts["enable_wecom_card"].(bool)
 	mcpAPIKey, _ := opts["mcp_apikey"].(string)
 	mcpBaseURL, _ := opts["mcp_url"].(string)
 
@@ -158,6 +164,7 @@ func newWebSocket(opts map[string]any) (core.Platform, error) {
 		allowFrom:           allowFrom,
 		wsURL:               wsURL,
 		groupSharedSessions: groupShared,
+		cardsEnabled:        cardsEnabled,
 		mcpAPIKey:           strings.TrimSpace(mcpAPIKey),
 		mcpBaseURL:          strings.TrimSpace(mcpBaseURL),
 	}, nil
@@ -667,6 +674,10 @@ func (p *WSPlatform) Send(ctx context.Context, rctx any, content string) error {
 	return nil
 }
 
+// CardsEnabled implements core.CardSwitcher. 见 cardsEnabled 字段说明：默认关闭，
+// engine 把本平台当纯文本；SendCard/ReplyCard 保留上游实现，开关开启后才被 engine 调用。
+func (p *WSPlatform) CardsEnabled() bool { return p.cardsEnabled }
+
 var _ core.CardSender = (*WSPlatform)(nil)
 
 // SendCard sends a structured card via aibot_send_msg. Implements core.CardSender.
@@ -739,6 +750,7 @@ func (p *WSPlatform) handleEventCallback(frame wsFrame) {
 		CreateTime int64  `json:"create_time"`
 		AibotID    string `json:"aibotid"`
 		ChatID     string `json:"chatid"`
+		ChatType   string `json:"chattype"` // single / group，官方文档「接收事件」必填字段
 		From       struct {
 			UserID string `json:"userid"`
 		} `json:"from"`
@@ -757,7 +769,8 @@ func (p *WSPlatform) handleEventCallback(frame wsFrame) {
 
 	if body.Event.EventType == "template_card_event" {
 		slog.Info("wecom-ws: template_card_event received", "user", body.From.UserID, "event_key", body.Event.EventKey, "task_id", body.Event.TaskID)
-		if !core.AllowList(p.allowFrom, body.From.UserID) {
+		// allowFrom 可被 /allowlist 运行时替换，经 allowMu 读快照再判断（与 handleMsgCallback 一致）
+		if !core.AllowList(p.GetAllowFrom(), body.From.UserID) {
 			slog.Warn("wecom-ws: event rejected by allow_from", "user", body.From.UserID)
 			return
 		}
@@ -766,6 +779,12 @@ func (p *WSPlatform) handleEventCallback(frame wsFrame) {
 			chatID = body.From.UserID
 		}
 		sessionKey := fmt.Sprintf("wecom:%s:%s", chatID, body.From.UserID)
+		if p.groupSharedSessions && body.ChatType == "group" {
+			// 群共享会话：权限/提问卡片挂在 group 会话的 interactive state 上，按钮
+			// 回调必须落回同一个会话键，否则引擎查不到待处理项、当过期回调丢弃。
+			// 判定条件与 handleMsgCallback 保持一致。
+			sessionKey = fmt.Sprintf("wecom:%s:group", chatID)
+		}
 		chatName := chatID
 		rctx := wsReplyContext{reqID: frame.Headers.ReqID, userID: body.From.UserID, chatID: chatID}
 

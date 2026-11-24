@@ -321,6 +321,15 @@ type CardSender interface {
 	ReplyCard(ctx context.Context, replyCtx any, card *Card) error
 }
 
+// CardSwitcher is an optional interface for platforms that implement
+// CardSender but gate it behind configuration. When CardsEnabled returns
+// false the engine treats the platform as text-only on every card path
+// (permission prompts, question and menu cards), exactly as if it did not
+// implement CardSender at all.
+type CardSwitcher interface {
+	CardsEnabled() bool
+}
+
 // CardNavigationHandler is called by platforms to render a card for in-place
 // card updates (e.g. Feishu card.action.trigger callback). The action string
 // uses prefixes like "nav:/model" or "act:/model 3".

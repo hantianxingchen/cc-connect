@@ -13498,8 +13498,23 @@ func (e *Engine) replyWithButtons(p Platform, replyCtx any, content string, butt
 	e.reply(p, replyCtx, content)
 }
 
+// cardSenderOf 返回平台的卡片发送视图。平台实现了 CardSender 但经配置关闭卡片
+// （core.CardSwitcher）时返回 false，所有卡片路径回落纯文本——企微卡片通道
+// 默认关闭依赖此语义；三处 CardSender 断言必须统一走这里，否则会出现
+// "权限提示走卡片、菜单走文本" 之类的半开状态。
+func cardSenderOf(p Platform) (CardSender, bool) {
+	cs, ok := p.(CardSender)
+	if !ok {
+		return nil, false
+	}
+	if sw, ok := p.(CardSwitcher); ok && !sw.CardsEnabled() {
+		return nil, false
+	}
+	return cs, true
+}
+
 func supportsCards(p Platform) bool {
-	_, ok := p.(CardSender)
+	_, ok := cardSenderOf(p)
 	return ok
 }
 
@@ -13514,7 +13529,7 @@ func (e *Engine) replyWithCard(p Platform, replyCtx any, card *Card) {
 		slog.Warn("outgoing rate limit: context cancelled", "platform", p.Name(), "error", err)
 		return
 	}
-	if cs, ok := p.(CardSender); ok {
+	if cs, ok := cardSenderOf(p); ok {
 		rendered := e.renderCardForPlatform(p, card)
 		if err := cs.ReplyCard(e.ctx, replyCtx, rendered); err != nil {
 			slog.Error("card reply failed", "platform", p.Name(), "error", err)
@@ -13534,7 +13549,7 @@ func (e *Engine) sendWithCard(p Platform, replyCtx any, card *Card) {
 		slog.Warn("outgoing rate limit: context cancelled", "platform", p.Name(), "error", err)
 		return
 	}
-	if cs, ok := p.(CardSender); ok {
+	if cs, ok := cardSenderOf(p); ok {
 		rendered := e.renderCardForPlatform(p, card)
 		if err := cs.SendCard(e.ctx, replyCtx, rendered); err != nil {
 			slog.Error("card send failed", "platform", p.Name(), "error", err)
