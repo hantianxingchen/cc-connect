@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -618,6 +619,13 @@ func main() {
 			if cfg.StreamPreview.DisabledPlatforms != nil {
 				spcfg.DisabledPlatforms = cfg.StreamPreview.DisabledPlatforms
 			}
+			if cfg.StreamPreview.StopBehavior != nil {
+				if !core.StopBehaviorIsValid(*cfg.StreamPreview.StopBehavior) {
+					slog.Error("invalid [stream_preview] stop_behavior: expected discard or freeze", "value", *cfg.StreamPreview.StopBehavior)
+					os.Exit(1)
+				}
+				spcfg.StopBehavior = *cfg.StreamPreview.StopBehavior
+			}
 			engine.SetStreamPreviewCfg(spcfg)
 		}
 
@@ -646,6 +654,7 @@ func main() {
 				})
 			}
 		}
+		applyDedupConfig(cfg, engine)
 		// Wire outgoing rate limiting
 		{
 			var maxPS float64
@@ -703,6 +712,12 @@ func main() {
 			engine.SetMaxTurnTime(time.Duration(*cfg.MaxTurnTimeMins) * time.Minute)
 		}
 
+		// Wire the /stop hook event. Unset keeps the historical default
+		// ("session.ended"); "turn.cancelled" opts in to the precise event.
+		if v := strings.TrimSpace(cfg.StopHookEvent); v != "" {
+			engine.SetStopHookEvent(core.HookEventType(strings.ToLower(v)))
+		}
+
 		// Wire queue depth
 		if cfg.Queue.MaxDepth != nil && *cfg.Queue.MaxDepth > 0 {
 			engine.SetMaxQueuedMessages(*cfg.Queue.MaxDepth)
@@ -720,6 +735,7 @@ func main() {
 			}
 			engine.SetAutoCompressConfigWithSource(true, maxTokens, minGap, proj.AutoCompress.AllowHeuristic)
 		}
+		applyHistoryBootstrapConfig(&proj, engine)
 		resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 		engine.SetResetOnIdle(resetIdle)
 		if defaulted {
@@ -1798,6 +1814,20 @@ func setupLogger(level string, w io.Writer) {
 	})))
 }
 
+func applyDedupConfig(cfg *config.Config, engine *core.Engine) {
+	enabled := cfg.Dedup.Enabled == nil || *cfg.Dedup.Enabled
+	windowSecs := 30
+	if cfg.Dedup.WindowSecs != nil && *cfg.Dedup.WindowSecs > 0 {
+		windowSecs = *cfg.Dedup.WindowSecs
+	}
+	engine.SetDedupConfig(enabled, time.Duration(windowSecs)*time.Second)
+}
+
+func applyHistoryBootstrapConfig(proj *config.ProjectConfig, engine *core.Engine) {
+	enabled := proj.HistoryBootstrap.Enabled == nil || *proj.HistoryBootstrap.Enabled
+	engine.SetHistoryBootstrap(enabled, derefInt(proj.HistoryBootstrap.MaxEntries), derefInt(proj.HistoryBootstrap.MaxTokens))
+}
+
 // reloadConfig re-reads config.toml and applies hot-reloadable settings
 // (display, providers, commands) to the given engine.
 func reloadConfig(configPath, projName string, engine *core.Engine) (*core.ConfigReloadResult, error) {
@@ -1863,6 +1893,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	} else {
 		engine.SetAutoCompressConfig(false, 0, 0)
 	}
+	applyHistoryBootstrapConfig(proj, engine)
 	resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 	engine.SetResetOnIdle(resetIdle)
 	if defaulted {
@@ -1892,12 +1923,22 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		engine.SetInstantReply(core.InstantReplyCfg{})
 	}
 
+	// Reload the /stop hook event. An empty value restores the default
+	// ("session.ended"), so removing the key from config.toml reverts the
+	// behavior just like a fresh start.
+	if v := strings.TrimSpace(cfg.StopHookEvent); v != "" {
+		engine.SetStopHookEvent(core.HookEventType(strings.ToLower(v)))
+	} else {
+		engine.SetStopHookEvent(core.HookEventSessionEnded)
+	}
+
 	// Reload sender injection
 	engine.SetInjectSender(proj.InjectSender != nil && *proj.InjectSender)
 
 	// Reload attachment send-back switch
 	engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
 
+	applyDedupConfig(cfg, engine)
 	// Reload filter_external_sessions
 	engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
 	engine.SetSessionOwnerFilter(proj.SessionOwnerFilter != nil && *proj.SessionOwnerFilter)
@@ -2051,8 +2092,48 @@ func wireAgentProviders(agent core.Agent, agentCfg config.AgentConfig) providerW
 	if result.explicitProviderRequested {
 		result.activeProviderApplied = ps.SetActiveProvider(active)
 		result.canStartInitialRefresh = result.activeProviderApplied
+	} else {
+		var applicable []core.ProviderConfig
+		for i, p := range agentCfg.Providers {
+			if len(p.AgentTypes) == 0 || containsString(p.AgentTypes, agentCfg.Type) {
+				applicable = append(applicable, providers[i])
+			}
+		}
+		switch len(applicable) {
+		case 1:
+			result.activeProviderApplied = ps.SetActiveProvider(applicable[0].Name)
+			result.canStartInitialRefresh = result.activeProviderApplied
+			if result.activeProviderApplied {
+				logActiveProviderRoute(applicable[0])
+			}
+		case 0:
+			// No configured provider applies to this agent type.
+		default:
+			names := make([]string, len(applicable))
+			for i, p := range applicable {
+				names[i] = p.Name
+			}
+			slog.Warn("multiple providers available; set options.provider to select one", "providers", names)
+		}
+	}
+	if result.explicitProviderRequested && result.activeProviderApplied {
+		if p := ps.GetActiveProvider(); p != nil {
+			logActiveProviderRoute(*p)
+		}
 	}
 	return result
+}
+
+func logActiveProviderRoute(p core.ProviderConfig) {
+	host := ""
+	if u, err := url.Parse(p.BaseURL); err == nil {
+		host = u.Hostname()
+	}
+	model := p.Model
+	if model == "" {
+		model = p.Env["ANTHROPIC_MODEL"]
+	}
+	slog.Info("agent provider route selected", "provider", p.Name, "base_url_host", host, "model", model)
 }
 
 func startInitialRefreshIfReady(agent core.Agent, result providerWiringResult) {

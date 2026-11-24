@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // ccPermissionHookEntry represents one PermissionRequest hook entry from
@@ -350,10 +351,15 @@ func buildHookStdin(hctx hookContext) map[string]any {
 	return m
 }
 
-// truncateStr truncates s to maxLen characters, appending "..." if truncated.
+// truncateStr truncates s to at most maxLen bytes without splitting a UTF-8
+// character, appending "..." if truncated.
 func truncateStr(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen] + "..."
+	cut := maxLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "..."
 }

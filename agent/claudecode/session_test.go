@@ -9,9 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -921,6 +923,38 @@ func TestHandleUserEmitsToolResult(t *testing.T) {
 	}
 }
 
+func TestHandleUserToolResultPreservesUTF8AtTruncation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cs := &claudeSession{events: make(chan core.Event, 1), ctx: ctx}
+	cs.alive.Store(true)
+	// A 500-byte cut lands inside the three-byte character.
+	result := strings.Repeat("a", 499) + "中" + "tail"
+	cs.handleUser(map[string]any{
+		"message": map[string]any{
+			"content": []any{map[string]any{
+				"type": "tool_result", "content": result,
+			}},
+		},
+	})
+
+	select {
+	case event := <-cs.events:
+		if event.Type != core.EventToolResult {
+			t.Fatalf("event type = %q, want %q", event.Type, core.EventToolResult)
+		}
+		if !utf8.ValidString(event.ToolResult) {
+			t.Fatalf("tool result is not valid UTF-8: %q", event.ToolResult)
+		}
+		if want := strings.Repeat("a", 499) + "..."; event.ToolResult != want {
+			t.Fatalf("tool result = %q, want %q", event.ToolResult, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for tool result")
+	}
+}
+
 func helperCommand(ctx context.Context, mode string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", mode)
 	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
@@ -1012,13 +1046,44 @@ func TestHelperProcess(t *testing.T) {
 			// JSON quoting.
 			turnText := line
 			var envelope struct {
-				Type    string `json:"type"`
-				Message struct {
+				Type      string `json:"type"`
+				RequestID string `json:"request_id"`
+				Message   struct {
 					Role    string `json:"role"`
 					Content any    `json:"content"`
 				} `json:"message"`
 			}
-			if err := json.Unmarshal([]byte(line), &envelope); err == nil && envelope.Type == "user" {
+			_ = json.Unmarshal([]byte(line), &envelope)
+			if envelope.Type == "control_request" {
+				mode := os.Getenv("CC_CONNECT_TEST_SETTINGS_MODE")
+				if mode == "ignore" {
+					continue
+				}
+				subtype := "success"
+				if mode == "error" {
+					subtype = "error"
+				}
+				resp, _ := json.Marshal(map[string]any{
+					"type": "control_response",
+					"response": map[string]any{
+						"subtype":    subtype,
+						"request_id": envelope.RequestID,
+						"error":      "test-credential-must-not-leak",
+						"response": map[string]any{
+							"applied": map[string]any{"effort": "xhigh"},
+						},
+					},
+				})
+				if mode == "malformed" {
+					resp = []byte("incomplete settings response")
+				}
+				if mode == "renamed" {
+					resp = bytes.Replace(resp, []byte("control_response"), []byte("settings_response"), 1)
+				}
+				_, _ = os.Stdout.Write(append(resp, '\n'))
+				continue
+			}
+			if envelope.Type == "user" {
 				switch c := envelope.Message.Content.(type) {
 				case string:
 					turnText = c
@@ -1050,6 +1115,39 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(0)
 	default:
 		os.Exit(2)
+	}
+}
+
+func TestRouterSessionKeepsVerboseForStreamJSON(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cs, err := newClaudeSession(ctx, t.TempDir(), os.Args[0],
+		[]string{"-test.run=TestHelperProcess", "--", "sleep"}, "", "", "", "", "default", "", "", nil, nil, nil,
+		[]string{"GO_WANT_HELPER_PROCESS=1", "ANTHROPIC_BASE_URL=http://127.0.0.1:3456"}, "",
+		core.SpawnOptions{}, 0, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+	if !slices.Contains(cs.cmd.Args, "--verbose") {
+		t.Fatalf("router session omitted --verbose: %v", cs.cmd.Args)
+	}
+}
+
+func TestReadLoopSkipsVerboseTextBeforeJSON(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cs := &claudeSession{events: make(chan core.Event, 2), ctx: ctx}
+	cs.alive.Store(true)
+	cs.handleReadLoopLine("verbose: connecting to router")
+	cs.handleReadLoopLine(`{"type":"result","subtype":"success","num_turns":1,"result":"router reply","session_id":"router-session"}`)
+	select {
+	case event := <-cs.events:
+		if event.Type != core.EventResult || event.Content != "router reply" {
+			t.Fatalf("event after verbose text = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("JSON result was lost after verbose text")
 	}
 }
 
@@ -1124,7 +1222,6 @@ func TestNewClaudeSession_NoReplayFlagKeepsProcessAlive(t *testing.T) {
 		nil,                                  // pluginDirs
 		[]string{"GO_WANT_HELPER_PROCESS=1"}, // extraEnv: route child into helper branch
 		"",                                   // platformPrompt
-		false,                                // disableVerbose
 		spawnOpts,
 		0,  // maxContextTokens
 		0,  // ctxWindowTokens
@@ -1202,6 +1299,11 @@ func TestNewClaudeSession_NoReplayFlagKeepsProcessAlive(t *testing.T) {
 	// Close() will send stdin EOF and the helper will exit cleanly.
 	if !cs.Alive() {
 		t.Fatal("helper died before Close() — keep-alive contract violated")
+	}
+	// The helper answered the startup get_settings request before echoing
+	// any turn, so the applied effort is known by now.
+	if got := cs.GetReasoningEffort(); got != "xhigh" {
+		t.Fatalf("GetReasoningEffort() = %q, want applied effort %q", got, "xhigh")
 	}
 }
 

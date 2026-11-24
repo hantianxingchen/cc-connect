@@ -19,6 +19,7 @@ import (
 
 	"github.com/chenhg5/cc-connect/agent/internal/skillroots"
 	"github.com/chenhg5/cc-connect/core"
+	"golang.org/x/text/unicode/norm"
 )
 
 func init() {
@@ -407,6 +408,12 @@ func (a *Agent) configuredModels() []core.ModelOption {
 }
 
 func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
+	a.mu.RLock()
+	minimaxModels := core.GetMiniMaxProviderModels(a.providers, a.activeIdx)
+	a.mu.RUnlock()
+	if len(minimaxModels) > 0 {
+		return minimaxModels
+	}
 	if models := a.configuredModels(); len(models) > 0 {
 		return models
 	}
@@ -418,6 +425,7 @@ func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 		{Name: "sonnet[1m]", Desc: "Claude Sonnet (1M context)"},
 		{Name: "opus", Desc: "Claude Opus (most capable)"},
 		{Name: "opus[1m]", Desc: "Claude Opus (1M context)"},
+		{Name: "fable", Desc: "Claude Fable (frontier)"},
 		{Name: "haiku", Desc: "Claude Haiku (fastest)"},
 	}
 }
@@ -748,12 +756,9 @@ func (a *Agent) startSessionLocked(ctx context.Context, sessionID string, modeOv
 	// prompt. Read under the mutex and pass through to newClaudeSession so the
 	// session picks up the right tool-prompt bundle at spawn time.
 	lang := a.lang
-	// When router_url is set, --verbose conflicts with --output-format stream-json
-	// (verbose emits non-JSON text to stdout that corrupts the JSON stream).
-	disableVerbose := a.routerURL != ""
 	a.mu.Unlock()
 
-	return newClaudeSession(ctx, workDir, a.cmd, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok, ctxWin, a.ccDataDir, lang)
+	return newClaudeSession(ctx, workDir, a.cmd, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, a.spawnOpts, maxTok, ctxWin, a.ccDataDir, lang)
 }
 
 func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, error) {
@@ -849,6 +854,14 @@ func extractStringContent(raw json.RawMessage) string {
 	return s
 }
 
+// maxSessionJSONLLineSize is the longest single line read from a Claude Code
+// session transcript. Lines carrying base64 images or prompt snapshots can
+// pass 256KB in normal use. The Codex reader uses the same ceiling. ListSessions
+// scans files one at a time; a future parallel scan must bound its concurrency
+// because each scanner can grow to this size. It is a variable only so tests
+// can use a small ceiling.
+var maxSessionJSONLLineSize = 64 * 1024 * 1024
+
 func scanSessionMeta(path string) (string, int) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -857,7 +870,7 @@ func scanSessionMeta(path string) (string, int) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	scanner.Buffer(make([]byte, 256*1024), maxSessionJSONLLineSize)
 
 	var firstUserMessage string
 	var aiTitle string
@@ -893,6 +906,10 @@ func scanSessionMeta(path string) (string, int) {
 				}
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		// /list has no error to return, so keep the partial result and log it.
+		slog.Warn("claudecode: session transcript scan stopped early; message count may be low", "path", path, "error", err)
 	}
 
 	summary := customTitle
@@ -954,7 +971,7 @@ func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int
 
 	var entries []core.HistoryEntry
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	scanner.Buffer(make([]byte, 256*1024), maxSessionJSONLLineSize)
 
 	for scanner.Scan() {
 		var raw struct {
@@ -983,6 +1000,9 @@ func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int
 			Content:   text,
 			Timestamp: ts,
 		})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("claudecode: read session file: %w", err)
 	}
 
 	if limit > 0 && len(entries) > limit {
@@ -1636,33 +1656,14 @@ func getBaseURLEnvVarForProviderType(providerType string) string {
 	}
 }
 
-// summarizeInput produces a short human-readable description of tool input.
+// summarizeInput preserves structured tool input for downstream renderers.
+// Card renderers apply their own allowlist and redaction; reducing common tools
+// to one field here would discard parameters such as grep include/path and bash
+// descriptions before the renderer can inspect them.
 func summarizeInput(tool string, input any) string {
 	m, ok := input.(map[string]any)
 	if !ok {
 		return ""
-	}
-
-	switch tool {
-	case "Read", "Edit", "Write":
-		if fp, ok := m["file_path"].(string); ok {
-			return fp
-		}
-	case "Bash":
-		if cmd, ok := m["command"].(string); ok {
-			return cmd
-		}
-	case "Grep":
-		if p, ok := m["pattern"].(string); ok {
-			return p
-		}
-	case "Glob":
-		if p, ok := m["pattern"].(string); ok {
-			return p
-		}
-		if p, ok := m["glob_pattern"].(string); ok {
-			return p
-		}
 	}
 
 	b, err := json.Marshal(m)
@@ -1727,8 +1728,15 @@ func boolVal(m map[string]any, key string) bool {
 //     "/Users/x/Library/Mobile Documents/com~apple~CloudDocs/...")
 //  5. Replacing all non-ASCII characters with "-"
 func encodeClaudeProjectKey(absPath string) string {
-	// First, normalize to forward slashes for consistent processing
-	normalized := strings.ReplaceAll(absPath, "\\", "/")
+	// Normalize only the key input; keep the original path when launching Claude.
+	if absPath == "" {
+		return ""
+	}
+	normalized := filepath.Clean(strings.ReplaceAll(absPath, "\\", "/"))
+	if len(normalized) >= 2 && normalized[1] == ':' && normalized[0] >= 'a' && normalized[0] <= 'z' {
+		normalized = strings.ToUpper(normalized[:1]) + normalized[1:]
+	}
+	normalized = norm.NFC.String(normalized)
 
 	// Build the encoded key character by character.
 	// Claude Code replaces path separators, special punctuation, and non-ASCII
